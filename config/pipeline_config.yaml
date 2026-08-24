@@ -1,0 +1,71 @@
+pipeline:
+  catalog: "meu_catalog"
+  bronze_schema: "bronze"
+  silver_schema: "silver"
+  
+  landing_base_path: "/Volumes/meu_catalog/landing/mflix"
+  checkpoint_base_path: "/Volumes/meu_catalog/checkpoints/mflix"
+  schema_base_path: "/Volumes/meu_catalog/schemas/mflix"
+
+  batch_size: 5000
+  max_retries: 3
+
+  infer_column_types: true
+
+  schema_evolution_mode: "rescue"
+
+  available_now: true
+
+
+collections:
+
+  - database: "sample_mflix"
+    collection: "movies"
+    enabled: true
+    modo_carga: "incremental"
+    campo_watermark: "lastupdated"
+    destino: "movies"
+    projecao: {}
+
+  - database: "sample_mflix"
+    collection: "comments"
+    enabled: true
+    modo_carga: "incremental"
+    campo_watermark: "date"
+    destino: "comments"
+    projecao: {}
+
+  - database: "sample_mflix"
+    collection: "users"
+    enabled: true
+    modo_carga: "full"
+    campo_watermark: null
+    destino: "users"
+    projecao:
+      password: 0
+
+  - database: "sample_mflix"
+    collection: "theaters"
+    enabled: true
+    modo_carga: "full"
+    campo_watermark: null
+    destino: "theaters"
+    projecao: {}
+
+  - database: "sample_mflix"
+    collection: "sessions"
+    enabled: true
+    modo_carga: "full"
+    campo_watermark: null
+    destino: "sessions"
+    projecao:
+      jwt: 0
+
+  - database: "sample_mflix"
+    collection: "embedded_movies"
+    enabled: true
+    modo_carga: "full"
+    campo_watermark: null
+    destino: "embedded_movies"
+    projecao:
+      plot_embedding: 0
