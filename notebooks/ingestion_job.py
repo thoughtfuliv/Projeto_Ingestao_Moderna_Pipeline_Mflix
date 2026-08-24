@@ -191,7 +191,6 @@ MOVIES_SCHEMA_DICT = {
     "_corrupt_record": "string",
 }
 
-
 # --- comments: date ISODate nativo -> chega como string ISO após o encode do MongoReader ---
 COMMENTS_SCHEMA_DICT = {
     "name": "string",
