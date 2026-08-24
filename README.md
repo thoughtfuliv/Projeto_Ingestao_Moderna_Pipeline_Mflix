@@ -1,0 +1,3 @@
+Para coleções full (dimensões pequenas: users, theaters, sessions, embedded_movies), a Bronze é tratada como snapshot completo por execução via overwrite — cada execução substitui o snapshot anterior, mantendo fidelidade total à origem no momento da leitura. Para coleções incrementais (movies, comments), a Bronze é estritamente append-only via MERGE ... WHEN NOT MATCHED THEN INSERT, nunca reescrevendo histórico.
+
+Exceções à regra de fidelidade total: users.password (hash de credencial, risco de segurança), sessions.jwt (token ativo, risco de segurança), embedded_movies.plot_embedding (vetor de ~12KB/doc, não utilizado nesta camada). Excluídos via projection na extração, nunca pela Bronze silenciosamente.

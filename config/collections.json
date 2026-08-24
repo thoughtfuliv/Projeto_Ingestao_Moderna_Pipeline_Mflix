@@ -1,0 +1,19 @@
+[
+  {"database": "sample_mflix", "collection": "users", "modo_carga": "full",
+   "campo_watermark": null, "destino": "bronze.users", "projecao": {"password": 0}},
+
+  {"database": "sample_mflix", "collection": "theaters", "modo_carga": "full",
+   "campo_watermark": null, "destino": "bronze.theaters", "projecao": null},
+
+  {"database": "sample_mflix", "collection": "sessions", "modo_carga": "full",
+   "campo_watermark": null, "destino": "bronze.sessions", "projecao": {"jwt": 0}},
+
+  {"database": "sample_mflix", "collection": "embedded_movies", "modo_carga": "full",
+   "campo_watermark": null, "destino": "bronze.embedded_movies", "projecao": {"plot_embedding": 0}},
+
+  {"database": "sample_mflix", "collection": "movies", "modo_carga": "incremental",
+   "campo_watermark": "lastupdated", "destino": "bronze.movies", "projecao": {"fullplot": 0}},
+
+  {"database": "sample_mflix", "collection": "comments", "modo_carga": "incremental",
+   "campo_watermark": "date", "destino": "bronze.comments", "projecao": null}
+]
