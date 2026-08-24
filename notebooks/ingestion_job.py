@@ -380,7 +380,6 @@ def executar_ingestao(cfg: dict):
         df_raw = reader.read(cfg["collection"], filtro=filtro, projecao=cfg.get("projecao"))
         df = reader.expand(df_raw, schema=SCHEMAS_BY_COLLECTION[cfg["collection"]])
         df = enriquecer_bronze(df, cfg, ingestion_id)
-        df.cache()
         qtd_origem = df.count()
 
         carregar_bronze(df, cfg)
@@ -394,7 +393,6 @@ def executar_ingestao(cfg: dict):
         destino = f"{CATALOG}.{cfg['destino']}"
         qtd_destino = spark.table(destino).filter(F.col("_ingestion_id") == ingestion_id).count()
         status, msg = reconciliar(cfg, ingestion_id, qtd_origem, qtd_destino)
-        df.unpersist()
     except Exception as e:
         status, msg = "FAILED", str(e)[:500]
     finally:
