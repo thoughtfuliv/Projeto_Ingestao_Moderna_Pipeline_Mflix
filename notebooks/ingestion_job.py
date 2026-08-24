@@ -273,8 +273,16 @@ def gravar_watermark(collection: str, valor: str):
     ).write.format("delta").mode("append").saveAsTable(WATERMARK_TABLE)
 
 
+CONTROL_LOG_SCHEMA = """
+  _ingestion_id STRING, collection STRING, load_type STRING,
+  watermark_inicial STRING, watermark_final STRING,
+  qtd_lida_origem BIGINT, qtd_gravada_destino BIGINT,
+  start_time TIMESTAMP, end_time TIMESTAMP, duracao_seg DOUBLE,
+  status STRING, mensagem_erro STRING
+"""
+
 def log_execucao(row: dict):
-    spark.createDataFrame([row]).write.format("delta").mode("append").saveAsTable(CONTROL_TABLE)
+    spark.createDataFrame([row], schema=CONTROL_LOG_SCHEMA).write.format("delta").mode("append").saveAsTable(CONTROL_TABLE)
 
 
 def montar_filtro(cfg: dict, watermark_atual: str | None) -> dict:
