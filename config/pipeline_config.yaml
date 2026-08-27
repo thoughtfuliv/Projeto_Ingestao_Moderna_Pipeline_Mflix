@@ -1,8 +1,13 @@
 pipeline:
   catalog: "meu_catalog"
+  landing_schema: "landing"
+  checkpoints_schema: "checkpoints"
+  schemas_schema: "schemas"
   bronze_schema: "bronze"
   silver_schema: "silver"
-  
+
+  volume_name: "mflix"
+
   landing_base_path: "/Volumes/meu_catalog/landing/mflix"
   checkpoint_base_path: "/Volumes/meu_catalog/checkpoints/mflix"
   schema_base_path: "/Volumes/meu_catalog/schemas/mflix"
@@ -15,57 +20,3 @@ pipeline:
   schema_evolution_mode: "rescue"
 
   available_now: true
-
-
-collections:
-
-  - database: "sample_mflix"
-    collection: "movies"
-    enabled: true
-    modo_carga: "incremental"
-    campo_watermark: "lastupdated"
-    destino: "movies"
-    projecao: {}
-
-  - database: "sample_mflix"
-    collection: "comments"
-    enabled: true
-    modo_carga: "incremental"
-    campo_watermark: "date"
-    destino: "comments"
-    projecao: {}
-
-  - database: "sample_mflix"
-    collection: "users"
-    enabled: true
-    modo_carga: "full"
-    campo_watermark: null
-    destino: "users"
-    projecao:
-      password: 0
-
-  - database: "sample_mflix"
-    collection: "theaters"
-    enabled: true
-    modo_carga: "full"
-    campo_watermark: null
-    destino: "theaters"
-    projecao: {}
-
-  - database: "sample_mflix"
-    collection: "sessions"
-    enabled: true
-    modo_carga: "full"
-    campo_watermark: null
-    destino: "sessions"
-    projecao:
-      jwt: 0
-
-  - database: "sample_mflix"
-    collection: "embedded_movies"
-    enabled: true
-    modo_carga: "full"
-    campo_watermark: null
-    destino: "embedded_movies"
-    projecao:
-      plot_embedding: 0
