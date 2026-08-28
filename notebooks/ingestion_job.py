@@ -6,6 +6,7 @@
 # MAGIC %pip install pymongo
 # MAGIC dbutils.library.restartPython()
 # COMMAND ----------
+# Databricks notebook source
 # ============================================================
 # INGESTION JOB — MongoDB Atlas -> Landing Zone
 # ============================================================
@@ -16,123 +17,186 @@
 # 4. Registrar o resultado da extração na tabela de controle
 #
 # IMPORTANTE:
-# Este job NÃO grava na Bronze. A Bronze é responsabilidade exclusiva do bronze_job.py.
+# Este job NÃO grava na Bronze.
+# A Bronze é responsabilidade exclusiva do bronze_job.py.
 #
-# Boas práticas de uso de recursos aplicadas (R2 — mínimo 4 exigidas):
-#   1. Leitura paginada: cursor do PyMongo com batch_size configurável
-#   2. Projection pushdown: só os campos definidos em pipeline_config.yaml
-#   3. Reuso de conexão: um único MongoClient (com pool) para o job inteiro
-#   4. Retry com backoff exponencial em falha de leitura do Mongo
-#   5. Nunca materializamos a coleção inteira em memória (sem list(cursor))
-#
-# Idempotência (R3):
-#   - Carga FULL: antes de reexportar, a pasta da coleção na Landing é
-#     limpa. Assim cada execução representa o snapshot atual, e não um
-#     acúmulo de exportações anteriores (isso também é o que fazia a
-#     Bronze demorar cada vez mais a cada execução).
-#   - Carga INCREMENTAL: o filtro usa o watermark persistido na tabela
-#     de controle, então documentos já extraídos não são lidos de novo.
+# ============================================================
+
+
+# ============================================================
+# IMPORTS
 # ============================================================
 
 import datetime as dt
 import json
 import time
 import uuid
-from dataclasses import dataclass, field
+
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import bson
 import yaml
+
 from pymongo import MongoClient
 from pyspark.sql.functions import desc as spark_desc
+
 
 # ============================================================
 # CONFIGURAÇÃO
 # ============================================================
-# Infraestrutura (catalog, schemas, volume, parâmetros técnicos)
-# fica em pipeline_config.yaml. As coleções a processar ficam
-# separadas em collections.json, para trocar/adicionar coleções
-# sem tocar na configuração de infraestrutura.
-CONFIG_DIR = "/Workspace/Repos/<usuario>/Projeto_Ingestao_Moderna_Pipeline_Mflix/config"
 
-with open(f"{CONFIG_DIR}/pipeline_config.yaml", "r", encoding="utf-8") as f:
+# Caminho do projeto no Databricks
+CONFIG_DIR = (
+    "/Workspace/Users/lcspinheiro17@gmail.com/Projeto_Ingestao_Moderna_Pipeline_Mflix/config"
+)
+
+
+# ------------------------------------------------------------
+# Pipeline configuration
+# ------------------------------------------------------------
+
+with open(
+    f"{CONFIG_DIR}/pipeline_config.yaml",
+    "r",
+    encoding="utf-8"
+) as f:
     CONFIG = yaml.safe_load(f)
 
-with open(f"{CONFIG_DIR}/collections.json", "r", encoding="utf-8") as f:
-    COLLECTIONS = json.load(f)["collections"]
+
+# ------------------------------------------------------------
+# Collections configuration
+# ------------------------------------------------------------
+
+with open(
+    f"{CONFIG_DIR}/collections.json",
+    "r",
+    encoding="utf-8"
+) as f:
+    COLLECTIONS = json.load(f)
+
 
 PIPELINE = CONFIG["pipeline"]
+
 
 CATALOG = PIPELINE["catalog"]
 LANDING_SCHEMA = PIPELINE["landing_schema"]
 BRONZE_SCHEMA = PIPELINE["bronze_schema"]
-CHECKPOINTS_SCHEMA = PIPELINE["checkpoints_schema"]
-SCHEMAS_SCHEMA = PIPELINE["schemas_schema"]
 VOLUME_NAME = PIPELINE["volume_name"]
 
-BATCH_SIZE = int(PIPELINE.get("batch_size", 5000))
-MAX_RETRIES = int(PIPELINE.get("max_retries", 3))
 
-CONTROL_TABLE = f"{CATALOG}.{BRONZE_SCHEMA}.control_ingestion_log"
+# ------------------------------------------------------------
+# Parâmetros técnicos
+# ------------------------------------------------------------
 
-# Landing Zone dentro de um Volume gerenciado pelo Unity Catalog —
-# funciona em qualquer workspace/cloud, sem path físico hardcoded.
-LANDING_BASE_PATH = f"/Volumes/{CATALOG}/{LANDING_SCHEMA}/{VOLUME_NAME}/landing/sample_mflix"
+BATCH_SIZE = int(
+    PIPELINE.get("batch_size", 5000)
+)
+
+MAX_RETRIES = int(
+    PIPELINE.get("max_retries", 3)
+)
 
 
 # ============================================================
-# SETUP DE INFRAESTRUTURA (catalog / schemas / volumes)
+# TABELA DE CONTROLE
 # ============================================================
+
+CONTROL_TABLE = (
+    f"{CATALOG}.{BRONZE_SCHEMA}.control_ingestion_log"
+)
+
+
+# ============================================================
+# LANDING ZONE
+# ============================================================
+
+# IMPORTANTE:
+# Não colocar "/landing/sample_mflix" aqui.
+#
+# O Volume já é:
+#
+# /Volumes/meu_catalog/landing/mflix/
+#
+# As coleções serão criadas diretamente dentro dele.
+
+LANDING_BASE_PATH = (
+    f"/Volumes/"
+    f"{CATALOG}/"
+    f"{LANDING_SCHEMA}/"
+    f"{VOLUME_NAME}"
+)
+
+
+# ============================================================
+# SETUP UNITY CATALOG
+# ============================================================
+
 def setup_unity_catalog_objects():
     """
-    Cria toda a infraestrutura do Unity Catalog necessária, de forma
-    idempotente (IF NOT EXISTS). Assim a pipeline roda em qualquer
-    workspace Databricks com Unity Catalog habilitado, sem setup
-    manual prévio.
+    Cria somente a infraestrutura necessária para o projeto.
+
+    Estrutura:
+
+    Catalog
+      ├── landing
+      │    └── Volume mflix
+      │
+      └── bronze
+           └── tabelas Bronze
+
+    Não são criados schemas separados para:
+    - checkpoints
+    - schema inference
     """
-    spark.sql(f"CREATE CATALOG IF NOT EXISTS {CATALOG}")
 
-    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{LANDING_SCHEMA}")
-    spark.sql(f"CREATE VOLUME IF NOT EXISTS {CATALOG}.{LANDING_SCHEMA}.{VOLUME_NAME}")
+    spark.sql(
+        f"CREATE CATALOG IF NOT EXISTS {CATALOG}"
+    )
 
-    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{BRONZE_SCHEMA}")
+    spark.sql(
+        f"CREATE SCHEMA IF NOT EXISTS "
+        f"{CATALOG}.{LANDING_SCHEMA}"
+    )
 
-    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{CHECKPOINTS_SCHEMA}")
-    spark.sql(f"CREATE VOLUME IF NOT EXISTS {CATALOG}.{CHECKPOINTS_SCHEMA}.{VOLUME_NAME}")
+    spark.sql(
+        f"CREATE VOLUME IF NOT EXISTS "
+        f"{CATALOG}.{LANDING_SCHEMA}.{VOLUME_NAME}"
+    )
 
-    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMAS_SCHEMA}")
-    spark.sql(f"CREATE VOLUME IF NOT EXISTS {CATALOG}.{SCHEMAS_SCHEMA}.{VOLUME_NAME}")
+    spark.sql(
+        f"CREATE SCHEMA IF NOT EXISTS "
+        f"{CATALOG}.{BRONZE_SCHEMA}"
+    )
+
+
+# ============================================================
+# CONTROLE DE EXECUÇÕES
+# ============================================================
 
 CONTROL_SCHEMA = (
-    "_ingestion_id STRING, collection STRING, load_type STRING, "
-    "watermark_inicial STRING, watermark_final STRING, "
-    "qtd_lida_origem BIGINT, qtd_gravada_destino BIGINT, "
-    "start_time TIMESTAMP, end_time TIMESTAMP, duracao_seg DOUBLE, "
-    "status STRING, mensagem_erro STRING"
-)
-
-# ============================================================
-# MONGODB — conexão única, reutilizada por todas as coleções (R2.3)
-# ============================================================
-MONGODB_URI = dbutils.secrets.get(
-    scope="conn-db",
-    key="cnn-mongodb-sampleflix",
-)
-
-MONGO_CLIENT = MongoClient(
-    MONGODB_URI,
-    serverSelectionTimeoutMS=15000,
-    socketTimeoutMS=300000,
-    appName="mflix-modern-ingestion",
-    maxPoolSize=20,
+    "_ingestion_id STRING, "
+    "collection STRING, "
+    "load_type STRING, "
+    "watermark_inicial STRING, "
+    "watermark_final STRING, "
+    "qtd_lida_origem BIGINT, "
+    "qtd_gravada_destino BIGINT, "
+    "start_time TIMESTAMP, "
+    "end_time TIMESTAMP, "
+    "duracao_seg DOUBLE, "
+    "status STRING, "
+    "mensagem_erro STRING"
 )
 
 
-# ============================================================
-# CONTROLE DE EXECUÇÕES (R5)
-# ============================================================
 def create_control_table():
-    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{BRONZE_SCHEMA}")
+
+    spark.sql(
+        f"CREATE SCHEMA IF NOT EXISTS "
+        f"{CATALOG}.{BRONZE_SCHEMA}"
+    )
+
     spark.sql(
         f"""
         CREATE TABLE IF NOT EXISTS {CONTROL_TABLE} (
@@ -154,27 +218,38 @@ def create_control_table():
     )
 
 
+# ============================================================
+# RESULTADO DA EXTRAÇÃO
+# ============================================================
+
 @dataclass
 class ExtractionResult:
+
     ingestion_id: str
     collection: str
     load_type: str
+
     watermark_inicial: Optional[str]
     watermark_final: Optional[str]
+
     qtd_lida_origem: int
+
     start_time: dt.datetime
     end_time: dt.datetime
+
     status: str
+
     mensagem_erro: Optional[str] = None
 
 
-def log_control_extraction(result: ExtractionResult):
-    """
-    Insere a linha inicial da execução (fase de extração), com
-    status 'EXTRACTED'. O bronze_job.py completa depois essa mesma
-    linha (via MERGE por _ingestion_id) com qtd_gravada_destino e
-    o status final (SUCCESS | PARTIAL | FAILED), após reconciliar.
-    """
+# ============================================================
+# LOG DA EXTRAÇÃO
+# ============================================================
+
+def log_control_extraction(
+    result: ExtractionResult
+):
+
     row = spark.createDataFrame(
         [
             (
@@ -194,269 +269,836 @@ def log_control_extraction(result: ExtractionResult):
         ],
         schema=CONTROL_SCHEMA,
     )
-    row.write.format("delta").mode("append").saveAsTable(CONTROL_TABLE)
 
-    # Repassa o _ingestion_id para o bronze_job.py, se os dois jobs
-    # estiverem orquestrados como tasks do mesmo Databricks Job.
-    # Se o notebook for rodado de forma avulsa, o bronze_job.py cai
-    # no fallback de ler a última linha 'EXTRACTED' desta coleção.
+    row.write \
+        .format("delta") \
+        .mode("append") \
+        .saveAsTable(CONTROL_TABLE)
+
+
+    # Passa o ingestion_id para o bronze_job.py
+    # quando os notebooks estiverem sendo executados
+    # como tasks do mesmo Databricks Job.
+
     try:
+
         dbutils.jobs.taskValues.set(
             key=f"ingestion_id__{result.collection}",
             value=result.ingestion_id,
         )
+
     except Exception:
         pass
 
 
 # ============================================================
-# HELPERS DE SERIALIZAÇÃO / WATERMARK
+# SERIALIZAÇÃO
 # ============================================================
+
 def encode_value(value):
-    """Converte tipos BSON para valores serializáveis em JSON."""
+    """
+    Converte tipos BSON para valores serializáveis em JSON.
+    """
+
     if isinstance(value, bson.ObjectId):
         return str(value)
-    if isinstance(value, (dt.datetime, dt.date)):
+
+    if isinstance(
+        value,
+        (dt.datetime, dt.date)
+    ):
         return value.isoformat()
-    if isinstance(value, bson.Decimal128):
+
+    if isinstance(
+        value,
+        bson.Decimal128
+    ):
         return str(value)
+
     if isinstance(value, bytes):
         return value.hex()
+
     return str(value)
 
 
+# ============================================================
+# WATERMARK
+# ============================================================
+
 def parse_watermark(value):
-    """Converte watermark ISO para datetime quando necessário."""
+
     if not value:
         return None
-    value = value.replace("Z", "+00:00")
-    parsed = dt.datetime.fromisoformat(value)
+
+    value = value.replace(
+        "Z",
+        "+00:00"
+    )
+
+    parsed = dt.datetime.fromisoformat(
+        value
+    )
+
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        parsed = parsed.replace(
+            tzinfo=dt.timezone.utc
+        )
+
     return parsed
 
 
-def get_nested_value(document, field_name):
-    """Busca campo simples ou nested usando dot notation."""
+def get_nested_value(
+    document,
+    field_name
+):
+    """
+    Busca campo simples ou nested
+    usando dot notation.
+    """
+
     value = document
+
     for part in field_name.split("."):
-        if not isinstance(value, dict):
+
+        if not isinstance(
+            value,
+            dict
+        ):
             return None
+
         value = value.get(part)
+
     return value
 
 
 def get_last_watermark(collection):
+
     """
-    Busca o último watermark_final registrado com sucesso na tabela
-    de controle para esta coleção. Retorna None se ainda não houver.
+    Busca o último watermark_final registrado
+    com sucesso na tabela de controle.
     """
+
     try:
-        if not spark.catalog.tableExists(CONTROL_TABLE):
+
+        if not spark.catalog.tableExists(
+            CONTROL_TABLE
+        ):
             return None
+
+
         row = (
             spark.table(CONTROL_TABLE)
             .filter(
                 f"collection = '{collection}' "
                 f"AND load_type = 'incremental' "
-                f"AND status IN ('SUCCESS', 'PARTIAL')"
+                f"AND status IN "
+                f"('SUCCESS', 'PARTIAL')"
             )
-            .orderBy(spark_desc("end_time"))
+            .orderBy(
+                spark_desc("end_time")
+            )
             .first()
         )
-        return row["watermark_final"] if row else None
+
+
+        return (
+            row["watermark_final"]
+            if row
+            else None
+        )
+
+
     except Exception:
+
         return None
 
 
-def build_filter(collection_cfg, watermark):
+# ============================================================
+# FILTRO MONGODB
+# ============================================================
+
+def build_filter(
+    collection_cfg,
+    watermark
+):
+
     """
-    Monta o filtro incremental.
-      Full:        {}
-      Incremental: campo_watermark > último watermark
+    Full:
+        {}
+
+    Incremental:
+        campo_watermark > último watermark
     """
-    if collection_cfg["modo_carga"] != "incremental":
+
+    if (
+        collection_cfg["modo_carga"]
+        != "incremental"
+    ):
         return {}
 
-    campo = collection_cfg.get("campo_watermark")
+
+    campo = collection_cfg.get(
+        "campo_watermark"
+    )
+
+
     if not campo or not watermark:
         return {}
 
-    # comments.date normalmente é armazenado como Date no MongoDB.
-    if collection_cfg["collection"] == "comments":
-        return {campo: {"$gt": parse_watermark(watermark)}}
 
-    # Para campos armazenados como string (ex.: movies.lastupdated).
-    return {campo: {"$gt": watermark}}
+    # comments.date normalmente é Date
+    # no MongoDB.
+
+    if (
+        collection_cfg["collection"]
+        == "comments"
+    ):
+
+        return {
+            campo: {
+                "$gt": parse_watermark(
+                    watermark
+                )
+            }
+        }
+
+
+    # Campos armazenados como string
+    # ex.: movies.lastupdated
+
+    return {
+        campo: {
+            "$gt": watermark
+        }
+    }
 
 
 # ============================================================
-# EXTRAÇÃO (extract + load na Landing)
+# MONGODB -> LANDING
 # ============================================================
+
 class MongoLandingExtractor:
+
     """
-    Componente genérico de extração (R1): recebe database, collection,
-    modo_carga, campo_watermark e destino via collection_cfg, e não tem
-    nada hardcoded específico de uma coleção.
+    Componente genérico de extração.
+
+    Recebe as configurações da coleção
+    e não possui lógica específica hardcoded
+    para cada coleção.
     """
 
-    def __init__(self, client: MongoClient, batch_size: int, max_retries: int):
+    def __init__(
+        self,
+        client: MongoClient,
+        batch_size: int,
+        max_retries: int
+    ):
+
         self.client = client
         self.batch_size = batch_size
         self.max_retries = max_retries
 
-    def _prepare_landing_dir(self, collection_cfg: Dict[str, Any], collection_path: str):
-        if collection_cfg["modo_carga"] == "full":
-            # Idempotência da carga full: o snapshot exportado agora
-            # substitui o anterior, em vez de se somar a ele.
-            dbutils.fs.rm(collection_path, recurse=True)
-        dbutils.fs.mkdirs(collection_path)
 
-    def extract(self, collection_cfg: Dict[str, Any]) -> ExtractionResult:
-        database = collection_cfg["database"]
-        collection = collection_cfg["collection"]
-        projection = collection_cfg.get("projecao") or {}
-        load_type = collection_cfg["modo_carga"]
+    # --------------------------------------------------------
+    # PREPARAÇÃO DA LANDING
+    # --------------------------------------------------------
 
-        ingestion_id = str(uuid.uuid4())
+    def _prepare_landing_dir(
+        self,
+        collection_cfg: Dict[str, Any],
+        collection_path: str
+    ):
+
+        # FULL:
+        # limpa toda a coleção antes de exportar
+        # o novo snapshot.
+
+        if (
+            collection_cfg["modo_carga"]
+            == "full"
+        ):
+
+            dbutils.fs.rm(
+                collection_path,
+                recurse=True
+            )
+
+
+        # Cria a pasta da execução.
+
+        dbutils.fs.mkdirs(
+            collection_path
+        )
+
+
+    # --------------------------------------------------------
+    # EXTRAÇÃO
+    # --------------------------------------------------------
+
+    def extract(
+        self,
+        collection_cfg: Dict[str, Any]
+    ) -> ExtractionResult:
+
+        database = collection_cfg[
+            "database"
+        ]
+
+        collection = collection_cfg[
+            "collection"
+        ]
+
+        projection = (
+            collection_cfg.get(
+                "projecao"
+            )
+            or {}
+        )
+
+        load_type = collection_cfg[
+            "modo_carga"
+        ]
+
+
+        # ----------------------------------------------------
+        # ID DA EXECUÇÃO
+        # ----------------------------------------------------
+
+        ingestion_id = str(
+            uuid.uuid4()
+        )
+
+
         start_time = dt.datetime.utcnow()
 
-        watermark_initial = (
-            get_last_watermark(collection) if load_type == "incremental" else None
-        )
-        mongo_filter = build_filter(collection_cfg, watermark_initial)
 
-        collection_path = f"{LANDING_BASE_PATH.rstrip('/')}/{collection}"
-        self._prepare_landing_dir(collection_cfg, collection_path)
+        # ----------------------------------------------------
+        # WATERMARK
+        # ----------------------------------------------------
+
+        watermark_initial = (
+
+            get_last_watermark(
+                collection
+            )
+
+            if load_type == "incremental"
+
+            else None
+        )
+
+
+        mongo_filter = build_filter(
+            collection_cfg,
+            watermark_initial
+        )
+
+
+        # ----------------------------------------------------
+        # DATA DA INGESTÃO
+        # ----------------------------------------------------
+
+        ingestion_date = (
+            dt.datetime.utcnow()
+            .strftime("%Y-%m-%d")
+        )
+
+
+        # ----------------------------------------------------
+        # CAMINHO DA COLEÇÃO
+        # ----------------------------------------------------
+
+        collection_path = (
+            f"{LANDING_BASE_PATH.rstrip('/')}/"
+            f"{collection}"
+        )
+
+
+        # ----------------------------------------------------
+        # CAMINHO FINAL DA EXECUÇÃO
+        # ----------------------------------------------------
+
+        # É AQUI que organizamos por data.
+        #
+        # Resultado:
+        #
+        # /comments/
+        #     _ingestion_date=2026-08-28/
+
+        execution_path = (
+            f"{collection_path}/"
+            f"_ingestion_date={ingestion_date}"
+        )
+
+
+        # ----------------------------------------------------
+        # PREPARA LANDING
+        # ----------------------------------------------------
+
+        self._prepare_landing_dir(
+            collection_cfg,
+            collection_path
+        )
+
+        # Depois do FULL limpar a coleção,
+        # recria a pasta da data.
+
+        dbutils.fs.mkdirs(
+            execution_path
+        )
+
+
+        # ----------------------------------------------------
+        # CONTADORES
+        # ----------------------------------------------------
 
         total = 0
+
         batch = []
+
         batch_number = 0
-        watermark_final = watermark_initial
+
+        watermark_final = (
+            watermark_initial
+        )
+
         status = "EXTRACTED"
+
         mensagem_erro = None
 
+
+        # ----------------------------------------------------
+        # LOG
+        # ----------------------------------------------------
+
         print("=" * 80)
-        print(f"Collection: {collection}")
-        print(f"Modo: {load_type}")
-        print(f"Watermark inicial: {watermark_initial}")
-        print(f"Filtro: {mongo_filter}")
+
+        print(
+            f"Collection: {collection}"
+        )
+
+        print(
+            f"Modo: {load_type}"
+        )
+
+        print(
+            f"Data da ingestão: "
+            f"{ingestion_date}"
+        )
+
+        print(
+            f"Landing: "
+            f"{execution_path}"
+        )
+
+        print(
+            f"Watermark inicial: "
+            f"{watermark_initial}"
+        )
+
+        print(
+            f"Filtro: "
+            f"{mongo_filter}"
+        )
+
         print("=" * 80)
+
+
+        # ----------------------------------------------------
+        # EXTRAÇÃO
+        # ----------------------------------------------------
 
         tentativa = 0
+
+
         try:
+
             while True:
+
                 try:
-                    # Leitura paginada via cursor (R2.1) + projection
-                    # pushdown (R2.2). Nunca convertemos o cursor em
-                    # lista nem usamos collect()/toPandas() (R2.4).
-                    cursor = self.client[database][collection].find(
-                        filter=mongo_filter,
-                        projection=projection,
-                        batch_size=self.batch_size,
+
+                    # ----------------------------------------
+                    # Cursor paginado
+                    # ----------------------------------------
+
+                    cursor = (
+                        self.client[
+                            database
+                        ][
+                            collection
+                        ].find(
+                            filter=mongo_filter,
+                            projection=projection,
+                            batch_size=self.batch_size,
+                        )
                     )
+
+
+                    # ----------------------------------------
+                    # Processa documento por documento
+                    # ----------------------------------------
+
                     for document in cursor:
-                        watermark_final = self._update_watermark_candidate(
-                            watermark_final,
-                            document,
-                            collection_cfg.get("campo_watermark"),
+
+                        watermark_final = (
+                            self._update_watermark_candidate(
+                                watermark_final,
+                                document,
+                                collection_cfg.get(
+                                    "campo_watermark"
+                                ),
+                            )
                         )
 
-                        body = json.dumps(document, default=encode_value, ensure_ascii=False)
-                        batch.append(body)
 
-                        if len(batch) >= self.batch_size:
-                            self._flush_batch(collection_path, collection, ingestion_id, batch_number, batch)
-                            total += len(batch)
+                        # ------------------------------------
+                        # JSON Lines
+                        # ------------------------------------
+
+                        body = json.dumps(
+                            document,
+                            default=encode_value,
+                            ensure_ascii=False
+                        )
+
+
+                        batch.append(
+                            body
+                        )
+
+
+                        # ------------------------------------
+                        # Grava lote
+                        # ------------------------------------
+
+                        if (
+                            len(batch)
+                            >= self.batch_size
+                        ):
+
+                            self._flush_batch(
+                                execution_path,
+                                collection,
+                                ingestion_id,
+                                batch_number,
+                                batch,
+                            )
+
+
+                            total += len(
+                                batch
+                            )
+
+
                             batch = []
+
                             batch_number += 1
 
+
                     cursor.close()
+
                     break
+
+
                 except Exception as exc:
+
                     tentativa += 1
-                    if tentativa > self.max_retries:
+
+
+                    if (
+                        tentativa
+                        > self.max_retries
+                    ):
                         raise
-                    espera = 2 ** tentativa
-                    print(
-                        f"Erro na leitura de {collection}: {exc}. "
-                        f"Tentativa {tentativa}/{self.max_retries}. "
-                        f"Aguardando {espera}s..."
+
+
+                    espera = (
+                        2 ** tentativa
                     )
-                    time.sleep(espera)
+
+
+                    print(
+                        f"Erro na leitura de "
+                        f"{collection}: {exc}. "
+                        f"Tentativa "
+                        f"{tentativa}/"
+                        f"{self.max_retries}. "
+                        f"Aguardando "
+                        f"{espera}s..."
+                    )
+
+
+                    time.sleep(
+                        espera
+                    )
+
+
+            # ------------------------------------------------
+            # Último lote
+            # ------------------------------------------------
 
             if batch:
-                self._flush_batch(collection_path, collection, ingestion_id, batch_number, batch)
-                total += len(batch)
+
+                self._flush_batch(
+                    execution_path,
+                    collection,
+                    ingestion_id,
+                    batch_number,
+                    batch,
+                )
+
+
+                total += len(
+                    batch
+                )
+
 
         except Exception as exc:
+
             status = "FAILED"
-            mensagem_erro = str(exc)
-            print(f"[ERRO] Falha ao extrair {collection}: {exc}")
+
+            mensagem_erro = str(
+                exc
+            )
+
+            print(
+                f"[ERRO] Falha ao "
+                f"extrair {collection}: "
+                f"{exc}"
+            )
+
+
+        # ----------------------------------------------------
+        # FINALIZAÇÃO
+        # ----------------------------------------------------
 
         end_time = dt.datetime.utcnow()
 
+
         print("=" * 80)
-        print(f"Exportação finalizada: {collection}")
-        print(f"Total exportado: {total}")
-        print(f"Watermark final: {watermark_final}")
-        print(f"Status: {status}")
+
+        print(
+            f"Exportação finalizada: "
+            f"{collection}"
+        )
+
+        print(
+            f"Landing final: "
+            f"{execution_path}"
+        )
+
+        print(
+            f"Total exportado: "
+            f"{total}"
+        )
+
+        print(
+            f"Watermark final: "
+            f"{watermark_final}"
+        )
+
+        print(
+            f"Status: "
+            f"{status}"
+        )
+
         print("=" * 80)
+
 
         return ExtractionResult(
+
             ingestion_id=ingestion_id,
+
             collection=collection,
+
             load_type=load_type,
-            watermark_inicial=watermark_initial,
-            watermark_final=watermark_final,
+
+            watermark_inicial=(
+                watermark_initial
+            ),
+
+            watermark_final=(
+                watermark_final
+            ),
+
             qtd_lida_origem=total,
+
             start_time=start_time,
+
             end_time=end_time,
+
             status=status,
-            mensagem_erro=mensagem_erro,
+
+            mensagem_erro=(
+                mensagem_erro
+            ),
         )
 
+
+    # --------------------------------------------------------
+    # ATUALIZA WATERMARK
+    # --------------------------------------------------------
+
     @staticmethod
-    def _update_watermark_candidate(current, document, field_name):
+    def _update_watermark_candidate(
+        current,
+        document,
+        field_name
+    ):
+
         if not field_name:
             return current
-        value = get_nested_value(document, field_name)
+
+
+        value = get_nested_value(
+            document,
+            field_name
+        )
+
+
         if value is None:
             return current
-        if isinstance(value, (dt.datetime, dt.date)):
+
+
+        if isinstance(
+            value,
+            (dt.datetime, dt.date)
+        ):
+
             value = value.isoformat()
+
+
         value = str(value)
-        if current is None or value > current:
+
+
+        if (
+            current is None
+            or value > current
+        ):
+
             return value
+
+
         return current
 
+
+    # --------------------------------------------------------
+    # GRAVA ARQUIVO JSONL
+    # --------------------------------------------------------
+
     @staticmethod
-    def _flush_batch(collection_path, collection, ingestion_id, batch_number, batch):
+    def _flush_batch(
+        execution_path,
+        collection,
+        ingestion_id,
+        batch_number,
+        batch
+    ):
+
+        # Nome do arquivo:
+        #
+        # comments__UUID__000000.json
+
         file_path = (
-            f"{collection_path}/{collection}__{ingestion_id}__{batch_number:06d}.json"
+            f"{execution_path}/"
+            f"{collection}__"
+            f"{ingestion_id}__"
+            f"{batch_number:06d}.json"
         )
-        # JSON Lines: uma linha = um documento MongoDB.
-        dbutils.fs.put(file_path, "\n".join(batch), overwrite=False)
-        print(f"Landing criada: {file_path} | registros: {len(batch)}")
+
+
+        # JSON Lines:
+        # uma linha = um documento MongoDB.
+
+        dbutils.fs.put(
+            file_path,
+            "\n".join(batch),
+            overwrite=False
+        )
+
+
+        print(
+            f"Wrote "
+            f"{len(''.join(batch))} bytes. "
+            f"Landing criada: "
+            f"{file_path} | "
+            f"registros: "
+            f"{len(batch)}"
+        )
 
 
 # ============================================================
 # EXECUÇÃO
 # ============================================================
+
 setup_unity_catalog_objects()
+
 create_control_table()
 
+
+# ------------------------------------------------------------
+# Cliente MongoDB único para o job inteiro
+# ------------------------------------------------------------
+
+MONGODB_URI = dbutils.secrets.get(
+    scope="conn-db",
+    key="cnn-mongodb-sampleflix",
+)
+
+
+MONGO_CLIENT = MongoClient(
+
+    MONGODB_URI,
+
+    serverSelectionTimeoutMS=15000,
+
+    socketTimeoutMS=300000,
+
+    appName="mflix-modern-ingestion",
+
+    maxPoolSize=20,
+)
+
+
+# ------------------------------------------------------------
+# Extractor
+# ------------------------------------------------------------
+
 extractor = MongoLandingExtractor(
+
     client=MONGO_CLIENT,
+
     batch_size=BATCH_SIZE,
+
     max_retries=MAX_RETRIES,
 )
 
+
+# ------------------------------------------------------------
+# Processamento das coleções
+# ------------------------------------------------------------
+
 try:
+
     for collection_cfg in COLLECTIONS:
-        if not collection_cfg.get("enabled", True):
+
+        if not collection_cfg.get(
+            "enabled",
+            True
+        ):
             continue
-        result = extractor.extract(collection_cfg)
-        log_control_extraction(result)
+
+
+        result = extractor.extract(
+            collection_cfg
+        )
+
+
+        log_control_extraction(
+            result
+        )
+
+
 finally:
+
     MONGO_CLIENT.close()
