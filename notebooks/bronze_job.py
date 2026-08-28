@@ -1,183 +1,286 @@
+# Databricks notebook source
+# ============================================================
+# BRONZE JOB — Landing Zone -> Bronze (Delta Lake)
+# ============================================================
 # Responsabilidade deste job:
 # 1. Ler arquivos da Landing Zone
-# 2. Utilizar Databricks Auto Loader
-# 3. Utilizar readStream
-# 4. Persistir schema inferido
-# 5. Utilizar checkpoint
-# 6. Adicionar metadados técnicos
-# 7. Gravar Bronze Delta em append-only
+# 2. Gravar Bronze append-only, com metadados de linhagem (R4)
+# 3. Tratar schema drift preservando registros não convertidos (R7)
+# 4. Reconciliar origem x destino e fechar a tabela de controle (R5, R8)
 #
 # IMPORTANTE:
 # Este job NÃO acessa o MongoDB.
 # O MongoDB -> Landing é responsabilidade do ingestion_job.py.
+#
+# Estratégia de idempotência por modo de carga (R3):
+#   - INCREMENTAL (comments, movies): Auto Loader em streaming, append,
+#     com checkpoint persistido dentro da própria Landing. O checkpoint
+#     garante que arquivos já processados não sejam reprocessados.
+#   - FULL (users, theaters): a Landing é limpa e reexportada por
+#     inteiro a cada execução (ver ingestion_job.py), então a Bronze
+#     usa "dynamic partition overwrite": só a partição
+#     _ingestion_date do dia é substituída, sem duplicar e sem
+#     apagar o histórico de dias anteriores.
+#
+# Estrutura física da Bronze (R6):
+#   A tabela {catalog}.{bronze_schema}.<collection> é gravada com
+#   partitionBy("_ingestion_date"), então o storage gerenciado pelo
+#   Unity Catalog fica organizado como:
+#     .../<collection>/_ingestion_date=YYYY-MM-DD/part-....parquet
+#   Não usamos um path de nuvem fixo (abfss://, s3://, etc.) de
+#   propósito: isso é o que permite rodar em qualquer workspace
+#   Databricks sem editar paths por cloud provider.
+# ============================================================
 
+import datetime as dt
 import json
-import time
-import uuid
-import yaml
 
+import yaml
+from delta.tables import DeltaTable
 from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    StringType, StructField, StructType, IntegerType, DoubleType, ArrayType,
-)
 
 # ============================================================
 # CONFIGURAÇÃO
 # ============================================================
-# pipeline_config.yaml: catalog, schemas, paths e parâmetros do Auto Loader.
-# collections.json: lista de coleções a processar (database, collection,
-# modo_carga, campo_watermark, destino, projecao).
+# Infraestrutura (catalog, schemas, volume, parâmetros técnicos)
+# fica em pipeline_config.yaml. As coleções a processar ficam
+# separadas em collections.json.
+CONFIG_DIR = "/Workspace/Repos/lcspinheiro17@gmail.com/Projeto_Ingestao_Moderna_Pipeline_Mflix/config"
 
-PIPELINE_CONFIG_PATH = "/Workspace/Users/lcspinheiro17@gmail.com/Projeto_Ingestao_Moderna_Pipeline_Mflix/config/pipeline_config.yaml"
-COLLECTIONS_CONFIG_PATH = "/Workspace/Users/lcspinheiro17@gmail.com/Projeto_Ingestao_Moderna_Pipeline_Mflix/config/collections.json"
+with open(f"{CONFIG_DIR}/pipeline_config.yaml", "r", encoding="utf-8") as f:
+    CONFIG = yaml.safe_load(f)
 
-with open(PIPELINE_CONFIG_PATH, "r", encoding="utf-8") as f:
-    PIPELINE = yaml.safe_load(f)["pipeline"]
+with open(f"{CONFIG_DIR}/collections.json", "r", encoding="utf-8") as f:
+    COLLECTIONS = json.load(f)["collections"]
 
-with open(COLLECTIONS_CONFIG_PATH, "r", encoding="utf-8") as f:
-    COLLECTIONS_CONFIG = json.load(f)
+PIPELINE = CONFIG["pipeline"]
 
 CATALOG = PIPELINE["catalog"]
+LANDING_SCHEMA = PIPELINE["landing_schema"]
 BRONZE_SCHEMA = PIPELINE["bronze_schema"]
-LANDING_BASE_PATH = PIPELINE["landing_base_path"]
-CHECKPOINT_BASE_PATH = PIPELINE["checkpoint_base_path"]
-SCHEMA_BASE_PATH = PIPELINE["schema_base_path"]
+VOLUME_NAME = PIPELINE["volume_name"]
+
 INFER_COLUMN_TYPES = bool(PIPELINE.get("infer_column_types", True))
 SCHEMA_EVOLUTION_MODE = PIPELINE.get("schema_evolution_mode", "rescue")
 AVAILABLE_NOW = bool(PIPELINE.get("available_now", True))
-
-# ============================================================
-# SCHEMAS EXPLÍCITOS POR COLLECTION
-# ============================================================
-# Em vez de depender só da inferência do Auto Loader, cada collection tem
-# um contrato de schema formal. Campos fora do contrato (e não existentes
-# no dict abaixo) vão parar em `_rescued_data` (schema_evolution_mode: rescue).
-# `_id` é incluído em todos os schemas para preservar o `_source_id` depois.
-
-_TIPOS = {
-    "string": StringType(),
-    "int": IntegerType(),
-    "double": DoubleType(),
-}
-
-
-def _para_tipo_spark(valor):
-    if isinstance(valor, dict):
-        return _para_struct(valor)
-    if valor.startswith("array<") and valor.endswith(">"):
-        return ArrayType(_TIPOS[valor[6:-1]])
-    return _TIPOS[valor]
-
-
-def _para_struct(d: dict) -> StructType:
-    return StructType([
-        StructField(nome, _para_tipo_spark(tipo), True)
-        for nome, tipo in d.items()
-    ])
-
-
-MOVIES_SCHEMA_DICT = {
-    "_id": "string",
-    "title": "string", "year": "int", "runtime": "int", "released": "string",
-    "rated": "string", "plot": "string", "genres": "array<string>",
-    "directors": "array<string>", "writers": "array<string>", "cast": "array<string>",
-    "countries": "array<string>", "languages": "array<string>",
-    "imdb": {"rating": "double", "votes": "int", "id": "int"},
-    "tomatoes": {
-        "viewer": {"rating": "double", "numReviews": "int", "meter": "int"},
-        "critic": {"rating": "double", "numReviews": "int", "meter": "int"},
-        "fresh": "int", "rotten": "int", "lastUpdated": "string",
-    },
-    "awards": {"wins": "int", "nominations": "int", "text": "string"},
-    "lastupdated": "string", "num_mflix_comments": "int",
-    "poster": "string", "type": "string", "_corrupt_record": "string",
-}
-
-COMMENTS_SCHEMA_DICT = {
-    "_id": "string",
-    "name": "string", "email": "string", "movie_id": "string",
-    "text": "string", "date": "string", "_corrupt_record": "string",
-}
-
-USERS_SCHEMA_DICT = {
-    "_id": "string",
-    "name": "string", "email": "string", "_corrupt_record": "string",
-    # password fica de fora do schema: é excluído via projeção {"password": 0} na leitura
-}
-
-THEATERS_SCHEMA_DICT = {
-    "_id": "string",
-    "theaterId": "int",
-    "location": {
-        "address": {"street1": "string", "city": "string", "state": "string", "zipcode": "string"},
-        "geo": {"type": "string", "coordinates": "array<double>"},
-    },
-    "_corrupt_record": "string",
-}
-
-SESSIONS_SCHEMA_DICT = {
-    "_id": "string",
-    "user_id": "string", "_corrupt_record": "string",
-    # jwt fica de fora do schema: é excluído via projeção {"jwt": 0} na leitura
-}
-
-EMBEDDED_MOVIES_SCHEMA_DICT = {
-    "_id": "string",
-    "title": "string", "year": "int", "plot": "string", "_corrupt_record": "string",
-    # plot_embedding fica de fora: excluído via projeção {"plot_embedding": 0}
-}
-
-SCHEMAS_DICT_BY_COLLECTION = {
-    "movies": MOVIES_SCHEMA_DICT,
-    "comments": COMMENTS_SCHEMA_DICT,
-    "users": USERS_SCHEMA_DICT,
-    "theaters": THEATERS_SCHEMA_DICT,
-    "sessions": SESSIONS_SCHEMA_DICT,
-    "embedded_movies": EMBEDDED_MOVIES_SCHEMA_DICT,
-}
-
-SCHEMAS_BY_COLLECTION = {
-    colecao: _para_struct(schema_dict)
-    for colecao, schema_dict in SCHEMAS_DICT_BY_COLLECTION.items()
-}
-
-# ============================================================
-# TABELA DE CONTROLE
-# ============================================================
+BRONZE_OUTPUT_PARTITIONS = int(PIPELINE.get("bronze_output_partitions", 4))
+RECONCILIATION_THRESHOLD_PCT = float(PIPELINE.get("reconciliation_threshold_pct", 0.5))
 
 CONTROL_TABLE = f"{CATALOG}.{BRONZE_SCHEMA}.control_ingestion_log"
 
+# Tudo que é arquivo auxiliar da ingestão fica organizado dentro da Landing.
+# Não criamos schemas/volumes separados para checkpoint ou schema inference.
+#
+# Estrutura:
+# landing/
+#   sample_mflix/
+#     users/
+#     theaters/
+#     comments/
+#     movies/
+#     _checkpoints/
+#       comments/
+#       movies/
+#     _schemas/
+#       comments/
+#       movies/
+#
+# A Bronze continua sendo tabela Delta gerenciada no schema Bronze.
+LANDING_BASE_PATH = f"/Volumes/{CATALOG}/{LANDING_SCHEMA}/{VOLUME_NAME}/landing/sample_mflix"
+CHECKPOINT_BASE_PATH = f"{LANDING_BASE_PATH}/_checkpoints"
+SCHEMA_BASE_PATH = f"{LANDING_BASE_PATH}/_schemas"
 
-def create_control_table():
+# Overwrite dinâmico por partição: só a(s) partição(ões) presentes no
+# DataFrame são substituídas, o resto da tabela permanece intacto.
+spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+
+
+# ============================================================
+# SETUP DE INFRAESTRUTURA (catalog / schemas / volumes)
+# ============================================================
+def setup_unity_catalog_objects():
+    """
+    Cria toda a infraestrutura do Unity Catalog necessária, de forma
+    idempotente (IF NOT EXISTS). Assim a pipeline roda em qualquer
+    workspace Databricks com Unity Catalog habilitado, mesmo que o
+    bronze_job.py seja executado sem o ingestion_job.py ter rodado
+    antes nesse workspace.
+    """
+    spark.sql(f"CREATE CATALOG IF NOT EXISTS {CATALOG}")
+
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{LANDING_SCHEMA}")
+    spark.sql(f"CREATE VOLUME IF NOT EXISTS {CATALOG}.{LANDING_SCHEMA}.{VOLUME_NAME}")
+
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{BRONZE_SCHEMA}")
-    spark.sql(f"""
+
+    # Checkpoints e metadados de schema ficam como diretórios dentro
+    # da Landing; não precisam de schema/volume próprio no Unity Catalog.
+    dbutils.fs.mkdirs(CHECKPOINT_BASE_PATH)
+    dbutils.fs.mkdirs(SCHEMA_BASE_PATH)
+
+
+# ============================================================
+# TABELA DE CONTROLE (R5) — schema alinhado ao ingestion_job.py
+# ============================================================
+def create_control_table():
+    spark.sql(
+        f"""
         CREATE TABLE IF NOT EXISTS {CONTROL_TABLE} (
-            ingestion_id STRING,
+            _ingestion_id STRING,
             collection STRING,
-            batch_id BIGINT,
-            qtd_registros BIGINT,
+            load_type STRING,
+            watermark_inicial STRING,
+            watermark_final STRING,
+            qtd_lida_origem BIGINT,
+            qtd_gravada_destino BIGINT,
             start_time TIMESTAMP,
             end_time TIMESTAMP,
+            duracao_seg DOUBLE,
             status STRING,
             mensagem_erro STRING
         )
         USING DELTA
-    """)
+        """
+    )
+
+
+def get_upstream_ingestion_id(collection: str):
+    """
+    Recupera o _ingestion_id gerado pelo ingestion_job.py para esta
+    coleção, para correlacionar extração e carga na mesma linha da
+    tabela de controle.
+    Preferência: taskValues (jobs orquestrados como tasks).
+    Fallback: última linha 'EXTRACTED' desta coleção na control table
+    (para quando o notebook roda avulso).
+    """
+    try:
+        value = dbutils.jobs.taskValues.get(
+            taskKey="ingestion_job",
+            key=f"ingestion_id__{collection}",
+            debugValue=None,
+        )
+        if value:
+            return value
+    except Exception:
+        pass
+
+    if not spark.catalog.tableExists(CONTROL_TABLE):
+        return None
+    row = (
+        spark.table(CONTROL_TABLE)
+        .filter(f"collection = '{collection}' AND status = 'EXTRACTED'")
+        .orderBy(F.col("start_time").desc())
+        .first()
+    )
+    return row["_ingestion_id"] if row else None
+
+
+def reconcile_and_close_control(collection: str, bronze_table: str, ingestion_id: str, start_time: dt.datetime):
+    """
+    R8 — Reconciliação e qualidade:
+      - contagem origem x destino
+      - % de nulos em _source_id
+      - duplicidade de _source_id no mesmo lote
+    Fecha a linha da tabela de controle com o status final.
+    """
+    end_time = dt.datetime.utcnow()
+
+    if not ingestion_id:
+        print(f"[RECONCILIAÇÃO] {collection}: sem _ingestion_id upstream, pulando reconciliação.")
+        return
+
+    df_batch = spark.table(bronze_table).filter(F.col("_ingestion_id") == ingestion_id)
+    qtd_gravada = df_batch.count()
+
+    null_source_id = df_batch.filter(F.col("_source_id").isNull()).count()
+    null_pct = (null_source_id / qtd_gravada * 100) if qtd_gravada else 0.0
+
+    dup_source_id = (
+        df_batch.groupBy("_source_id").count().filter("count > 1").count()
+    )
+
+    control_row = (
+        spark.table(CONTROL_TABLE).filter(f"_ingestion_id = '{ingestion_id}'").first()
+    )
+    qtd_lida_origem = control_row["qtd_lida_origem"] if control_row else None
+    control_start_time = control_row["start_time"] if control_row else start_time
+
+    divergence_pct = None
+    if qtd_lida_origem:
+        divergence_pct = abs(qtd_lida_origem - qtd_gravada) / qtd_lida_origem * 100
+
+    if qtd_gravada == 0 and (qtd_lida_origem or 0) > 0:
+        status = "FAILED"
+        mensagem_erro = "Nenhum registro gravado na Bronze apesar de haver dados na origem."
+    elif divergence_pct is not None and divergence_pct > RECONCILIATION_THRESHOLD_PCT:
+        status = "PARTIAL"
+        mensagem_erro = (
+            f"Divergência de {divergence_pct:.2f}% entre origem e destino "
+            f"(limiar configurado: {RECONCILIATION_THRESHOLD_PCT}%)."
+        )
+    elif dup_source_id > 0:
+        status = "PARTIAL"
+        mensagem_erro = f"{dup_source_id} valores de _source_id duplicados no lote."
+    elif null_pct > 0:
+        status = "PARTIAL"
+        mensagem_erro = f"{null_pct:.2f}% dos registros com _source_id nulo."
+    else:
+        status = "SUCCESS"
+        mensagem_erro = None
+
+    duracao_seg = (end_time - control_start_time).total_seconds()
+
+    updates_df = spark.createDataFrame(
+        [(ingestion_id, qtd_gravada, end_time, duracao_seg, status, mensagem_erro)],
+        schema=(
+            "_ingestion_id STRING, qtd_gravada_destino BIGINT, end_time TIMESTAMP, "
+            "duracao_seg DOUBLE, status STRING, mensagem_erro STRING"
+        ),
+    )
+
+    (
+        DeltaTable.forName(spark, CONTROL_TABLE)
+        .alias("t")
+        .merge(updates_df.alias("s"), "t._ingestion_id = s._ingestion_id")
+        .whenMatchedUpdate(
+            set={
+                "qtd_gravada_destino": "s.qtd_gravada_destino",
+                "end_time": "s.end_time",
+                "duracao_seg": "s.duracao_seg",
+                "status": "s.status",
+                "mensagem_erro": "s.mensagem_erro",
+            }
+        )
+        .execute()
+    )
+
+    print(
+        f"[RECONCILIAÇÃO] {collection}: origem={qtd_lida_origem} destino={qtd_gravada} "
+        f"nulos_source_id={null_pct:.2f}% duplicados={dup_source_id} status={status}"
+    )
 
 
 # ============================================================
-# METADADOS BRONZE
+# METADADOS DE LINHAGEM (R4)
 # ============================================================
-
-def add_bronze_metadata(df, collection_cfg):
+def add_bronze_metadata(df, collection_cfg, ingestion_id, load_type):
     return (
         df
-        .withColumn("_ingestion_id", F.expr("uuid()"))
+        # UUID da execução (run id) -- fixo para todo o lote, não por linha
+        .withColumn("_ingestion_id", F.lit(ingestion_id))
+        # Timestamp UTC da gravação
         .withColumn("_ingestion_timestamp", F.current_timestamp())
+        # Sistema de origem
         .withColumn("_source_path", F.lit("mongodb_atlas"))
-        .withColumn("_source_collection", F.lit(collection_cfg["collection"]))
-        .withColumn("_load_type", F.lit(collection_cfg["modo_carga"]))
+        # Arquivo físico na Landing que originou o registro (lineage extra)
+        .withColumn("_landing_file_path", F.input_file_name())
+        # full ou incremental
+        .withColumn("_load_type", F.lit(load_type))
+        # Data técnica -- também é a coluna de partição física
         .withColumn("_ingestion_date", F.current_date())
+        # Collection MongoDB de origem
+        .withColumn("_source_collection", F.lit(collection_cfg["collection"]))
+        # Chave natural do MongoDB, usada na reconciliação (R8)
         .withColumn(
             "_source_id",
             F.col("_id").cast("string") if "_id" in df.columns else F.lit(None).cast("string"),
@@ -186,60 +289,91 @@ def add_bronze_metadata(df, collection_cfg):
 
 
 # ============================================================
-# BRONZE
+# CARGA FULL — batch, overwrite dinâmico da partição do dia
 # ============================================================
-
-def load_to_bronze(collection_cfg):
+def load_to_bronze_full(collection_cfg, ingestion_id):
     collection = collection_cfg["collection"]
-    destino = collection_cfg["destino"]  # já vem como "bronze.<tabela>"
+    destination = collection_cfg["destino"]
+    landing_path = f"{LANDING_BASE_PATH.rstrip('/')}/{collection}"
+    bronze_table = f"{CATALOG}.{BRONZE_SCHEMA}.{destination}"
+
+    print("=" * 80)
+    print(f"BRONZE (FULL): {collection}")
+    print(f"Landing: {landing_path}")
+    print(f"Tabela: {bronze_table}")
+    print("Estrutura física: partitionBy(_ingestion_date) dentro do storage gerenciado pelo UC")
+    print("=" * 80)
+
+    # R7 -- schema drift: mode PERMISSIVE preserva registros que não
+    # batem com o schema inferido em vez de descartá-los.
+    df_raw = (
+        spark.read.format("json")
+        .option("inferSchema", "true")
+        .option("mode", "PERMISSIVE")
+        .option("columnNameOfCorruptRecord", "_rescued_data")
+        .load(landing_path)
+    )
+
+    df_bronze = add_bronze_metadata(
+        df_raw, collection_cfg, ingestion_id, collection_cfg["modo_carga"]
+    )
+
+    (
+        df_bronze
+        # R2.3 -- controle de partições/anti small-files na escrita
+        .repartition(BRONZE_OUTPUT_PARTITIONS)
+        .write.format("delta")
+        .mode("overwrite")  # dinâmico: só sobrescreve a partição do dia
+        .option("mergeSchema", "true")
+        .partitionBy("_ingestion_date")
+        .saveAsTable(bronze_table)
+    )
+
+    print(f"Bronze (full) concluída: {bronze_table}")
+
+
+# ============================================================
+# CARGA INCREMENTAL — Auto Loader streaming, append + checkpoint
+# ============================================================
+def load_to_bronze_incremental(collection_cfg, ingestion_id):
+    collection = collection_cfg["collection"]
+    destination = collection_cfg["destino"]
 
     landing_path = f"{LANDING_BASE_PATH.rstrip('/')}/{collection}"
     checkpoint_path = f"{CHECKPOINT_BASE_PATH.rstrip('/')}/{collection}"
     schema_path = f"{SCHEMA_BASE_PATH.rstrip('/')}/{collection}"
-
-    # destino já contém o schema (ex.: "bronze.movies") -> só falta o catálogo
-    bronze_table = f"{CATALOG}.{destino}"
+    bronze_table = f"{CATALOG}.{BRONZE_SCHEMA}.{destination}"
 
     print("=" * 80)
-    print(f"BRONZE: {collection}")
+    print(f"BRONZE (INCREMENTAL): {collection}")
     print(f"Landing: {landing_path}")
-    print(f"Schema: {schema_path}")
+    print(f"Schema inference: {schema_path}")
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Tabela: {bronze_table}")
+    print("Estrutura física: partitionBy(_ingestion_date) dentro do storage gerenciado pelo UC")
     print("=" * 80)
 
-    # ========================================================
-    # AUTO LOADER
-    # ========================================================
-    schema = SCHEMAS_BY_COLLECTION.get(collection)
-    if schema is None:
-        raise ValueError(
-            f"Não existe schema explícito definido para a collection '{collection}' "
-            f"em SCHEMAS_DICT_BY_COLLECTION."
-        )
-
     df_stream = (
-        spark.readStream
-        .format("cloudFiles")
+        spark.readStream.format("cloudFiles")
         .option("cloudFiles.format", "json")
         .option("cloudFiles.schemaLocation", schema_path)
         .option("cloudFiles.inferColumnTypes", str(INFER_COLUMN_TYPES).lower())
+        # R7 -- schema evolution + coluna de quarentena para campos
+        # inesperados (nunca descartados silenciosamente)
         .option("cloudFiles.schemaEvolutionMode", SCHEMA_EVOLUTION_MODE)
         .option("cloudFiles.rescuedDataColumn", "_rescued_data")
         .option("cloudFiles.includeExistingFiles", "true")
-        .schema(schema)
         .load(landing_path)
     )
 
-    df_bronze = add_bronze_metadata(df_stream, collection_cfg)
+    df_bronze = add_bronze_metadata(
+        df_stream, collection_cfg, ingestion_id, collection_cfg["modo_carga"]
+    )
 
-    # ========================================================
-    # WRITE STREAM
-    # ========================================================
     query = (
-        df_bronze.writeStream
-        .format("delta")
-        .outputMode("append")
+        df_bronze.repartition(BRONZE_OUTPUT_PARTITIONS)
+        .writeStream.format("delta")
+        .outputMode("append")  # idempotente: checkpoint evita reprocessar arquivo já lido
         .option("checkpointLocation", checkpoint_path)
         .option("mergeSchema", "true")
         .partitionBy("_ingestion_date")
@@ -247,32 +381,30 @@ def load_to_bronze(collection_cfg):
         .toTable(bronze_table)
     )
 
-    # `availableNow=True` deveria encerrar a query sozinha assim que
-    # processar tudo que já existe na Landing. Em compute Serverless
-    # (Spark Connect), tanto o awaitTermination() quanto checagens
-    # repetidas de status (isActive/lastProgress) podem ficar pendurados
-    # por instabilidade de comunicação client<->cluster. Por isso, em vez
-    # de fazer polling, esperamos um tempo fixo (suficiente pro volume de
-    # dados da Landing) e encerramos a query manualmente, sem depender de
-    # nenhuma chamada de status no meio do caminho.
-    TIMEOUT_SECONDS = 90
-    print(f"  aguardando até {TIMEOUT_SECONDS}s para o processamento da collection...")
-    time.sleep(TIMEOUT_SECONDS)
-    try:
-        query.stop()
-    except Exception as exc:
-        print(f"  aviso ao encerrar a query: {exc}")
-
-    print(f"Bronze concluída: {bronze_table}")
+    query.awaitTermination()
+    print(f"Bronze (incremental) concluída: {bronze_table}")
 
 
 # ============================================================
 # EXECUÇÃO
 # ============================================================
-
+setup_unity_catalog_objects()
 create_control_table()
 
-for collection_cfg in COLLECTIONS_CONFIG:
+for collection_cfg in COLLECTIONS:
     if not collection_cfg.get("enabled", True):
         continue
-    load_to_bronze(collection_cfg)
+
+    collection = collection_cfg["collection"]
+    destination = collection_cfg["destino"]
+    bronze_table = f"{CATALOG}.{BRONZE_SCHEMA}.{destination}"
+    start_time = dt.datetime.utcnow()
+
+    ingestion_id = get_upstream_ingestion_id(collection)
+
+    if collection_cfg["modo_carga"] == "full":
+        load_to_bronze_full(collection_cfg, ingestion_id)
+    else:
+        load_to_bronze_incremental(collection_cfg, ingestion_id)
+
+    reconcile_and_close_control(collection, bronze_table, ingestion_id, start_time)
