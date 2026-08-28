@@ -86,7 +86,7 @@ CONTROL_TABLE = f"{CATALOG}.{BRONZE_SCHEMA}.control_ingestion_log"
 #       movies/
 #
 # A Bronze continua sendo tabela Delta gerenciada no schema Bronze.
-LANDING_BASE_PATH = f"/Volumes/{CATALOG}/{LANDING_SCHEMA}/{VOLUME_NAME}/landing/sample_mflix"
+LANDING_BASE_PATH = f"/Volumes/{CATALOG}/{LANDING_SCHEMA}/{VOLUME_NAME}"
 CHECKPOINT_BASE_PATH = f"{LANDING_BASE_PATH}/_checkpoints"
 SCHEMA_BASE_PATH = f"{LANDING_BASE_PATH}/_schemas"
 
