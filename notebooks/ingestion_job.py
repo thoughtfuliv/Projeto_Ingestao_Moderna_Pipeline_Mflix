@@ -653,7 +653,7 @@ class MongoLandingExtractor:
             watermark_initial
         )
 
-        status = "EXTRACTED"
+        status = "SUCCESS"
 
         mensagem_erro = None
 

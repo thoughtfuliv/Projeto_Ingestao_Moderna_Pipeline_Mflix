@@ -1,10 +1,10 @@
-
 # Databricks notebook source
 
 # ============================================================
 # BRONZE JOB
 # Landing -> Bronze
 # ============================================================
+
 
 import datetime as dt
 import json
@@ -248,10 +248,21 @@ def create_control_table():
 def get_ingestion_id(collection):
 
     """
-    Tenta recuperar o ingestion_id do ingestion_job.
+    Tenta recuperar o ingestion_id do ingestion_job via
+    taskValues (funciona apenas quando os dois notebooks
+    rodam como tasks do MESMO Databricks Job orquestrado).
 
-    Caso esteja executando o notebook isoladamente,
-    gera um ID local.
+    Se estiver rodando os notebooks separadamente/manualmente
+    (execução interativa), taskValues.get() falha, e o ID
+    "bronze_<collection>_<timestamp>" gerado como fallback não
+    bate com nenhuma linha da control_ingestion_log — o que
+    fazia reconcile() atualizar 0 linhas e qtd_gravada_destino
+    ficar sempre null.
+
+    Fallback:busca na própria control_ingestion_log
+    o ingestion_id mais recente desta coleção que ainda não foi
+    reconciliado (qtd_gravada_destino IS NULL). Isso cobre o
+    caso de execução manual/interativa.
     """
 
     try:
@@ -266,6 +277,35 @@ def get_ingestion_id(collection):
         if value:
 
             return value
+
+    except Exception:
+
+        pass
+
+
+    try:
+
+        if spark.catalog.tableExists(
+            CONTROL_TABLE
+        ):
+
+            row = (
+                spark.table(CONTROL_TABLE)
+                .filter(
+                    f"collection = '{collection}' "
+                    f"AND status IN "
+                    f"('SUCCESS', 'EXTRACTED') "
+                    f"AND qtd_gravada_destino IS NULL"
+                )
+                .orderBy(
+                    F.desc("start_time")
+                )
+                .first()
+            )
+
+            if row:
+
+                return row["_ingestion_id"]
 
     except Exception:
 
@@ -879,6 +919,24 @@ def reconcile(
     start_time
 ):
 
+    """
+    CORREÇÃO: o UPDATE anterior montava o timestamp via
+    f-string (TIMESTAMP('{end_time.isoformat()}')), o que
+    podia falhar no parse dependendo do runtime do Spark SQL
+    (formato com 'T' e microssegundos). Como era uma única
+    instrução UPDATE, qualquer falha de parse fazia a linha
+    inteira não ser atualizada — explicando por que
+    qtd_gravada_destino e duracao_seg ficavam sempre null,
+    mesmo com status = SUCCESS (que vem do ingestion_job, não
+    daqui).
+
+    Agora usamos a API do Delta (DeltaTable.update), passando
+    os valores Python diretamente via F.lit — sem string
+    interpolada, sem parsing de SQL. Também adicionamos
+    traceback completo no except, para que qualquer falha
+    futura apareça no log com o stack trace inteiro.
+    """
+
     end_time = dt.datetime.utcnow()
 
 
@@ -920,29 +978,33 @@ def reconcile(
         )
 
 
-        spark.sql(
-            f"""
-            UPDATE {CONTROL_TABLE}
+        control = DeltaTable.forName(
+            spark,
+            CONTROL_TABLE
+        )
 
-            SET
-                qtd_gravada_destino =
-                    {qtd_destino},
 
-                end_time =
-                    TIMESTAMP(
-                        '{end_time.isoformat()}'
-                    ),
+        control.update(
 
-                duracao_seg =
-                    {duration},
+            condition=(
+                f"_ingestion_id = "
+                f"'{ingestion_id}'"
+            ),
 
-                status =
-                    'SUCCESS'
+            set={
 
-            WHERE
-                _ingestion_id =
-                    '{ingestion_id}'
-            """
+                "qtd_gravada_destino":
+                    F.lit(qtd_destino),
+
+                "end_time":
+                    F.lit(end_time),
+
+                "duracao_seg":
+                    F.lit(duration),
+
+                "status":
+                    F.lit("SUCCESS"),
+            },
         )
 
 
@@ -952,6 +1014,10 @@ def reconcile(
             f"[WARN] Falha na "
             f"reconciliação: {exc}"
         )
+
+        import traceback
+
+        traceback.print_exc()
 
 
 # ============================================================
@@ -1095,29 +1161,37 @@ for collection_cfg in COLLECTIONS:
 
         try:
 
-            spark.sql(
-                f"""
-                UPDATE {CONTROL_TABLE}
+            # CORREÇÃO: mesmo motivo do reconcile() —
+            # DeltaTable.update() em vez de UPDATE via SQL
+            # cru, evitando problema de parsing de TIMESTAMP
+            # e de escaping da mensagem de erro.
 
-                SET
-                    end_time =
-                        TIMESTAMP(
-                            '{end_time.isoformat()}'
-                        ),
+            control = DeltaTable.forName(
+                spark,
+                CONTROL_TABLE
+            )
 
-                    duracao_seg =
-                        {duration},
+            control.update(
 
-                    status =
-                        'FAILED',
+                condition=(
+                    f"_ingestion_id = "
+                    f"'{ingestion_id}'"
+                ),
 
-                    mensagem_erro =
-                        '{str(exc).replace("'", "''")}'
+                set={
 
-                WHERE
-                    _ingestion_id =
-                        '{ingestion_id}'
-                """
+                    "end_time":
+                        F.lit(end_time),
+
+                    "duracao_seg":
+                        F.lit(duration),
+
+                    "status":
+                        F.lit("FAILED"),
+
+                    "mensagem_erro":
+                        F.lit(str(exc)),
+                },
             )
 
         except Exception as control_error:
@@ -1127,6 +1201,10 @@ for collection_cfg in COLLECTIONS:
                 f"registrar erro: "
                 f"{control_error}"
             )
+
+            import traceback
+
+            traceback.print_exc()
 
 
         raise
