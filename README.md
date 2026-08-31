@@ -1,139 +1,153 @@
-# Projeto Ingestão Moderna - Pipeline Mflix
-Pipeline de ingestão de dados desenvolvida para o trabalho final da disciplina de **Engenharia de Dados / Ingestão Moderna de Dados**.
+﻿# Projeto Ingestão Moderna — Pipeline Mflix
 
-O projeto realiza a ingestão das coleções do banco `sample_mflix`, disponibilizado pelo MongoDB Atlas, e materializa os dados na camada **Bronze**  e **Silver** de um Data Lake utilizando **Databricks, PySpark e Delta Lake**.
+Pipeline do MongoDB Atlas para Databricks, desenvolvido para a disciplina de Engenharia de Dados / Ingestão Moderna de Dados. As seis coleções do banco `sample_mflix` são processadas por componentes genéricos e parametrizados, com cargas `full` ou `incremental`.
 
-A solução foi projetada para ser **genérica, parametrizada, incremental, rastreável e resiliente**, evitando a criação de código duplicado para cada coleção.
+## Arquitetura
 
-----------
-
-## 📌 Objetivo
-
-O objetivo do projeto é construir uma pipeline moderna de ingestão capaz de:
-
--   extrair dados do MongoDB Atlas;
-    
--   ingerir múltiplas collections utilizando o mesmo código;
-    
--   suportar cargas `full` e `incremental`;
-    
--   controlar cargas incrementais por watermark;
-    
--   realizar leitura em lotes;
-    
--   utilizar projection na origem;
-    
--   aplicar retry com backoff exponencial;
-    
--   preservar a rastreabilidade de cada execução;
-    
--   armazenar os dados na camada Bronze em formato Delta Lake;
-    
--   tratar registros que não possam ser convertidos;
-    
--   realizar reconciliação entre origem e destino;
-    
--   garantir idempotência na carga incremental.
-    
-
-O trabalho exige que todas as collections sejam ingeridas utilizando um único componente genérico e parametrizado.
-
-----------
-
-# 🏗️ Arquitetura
-A arquitetura foi dividida em **três jobs independentes**.
-
-## 2.1. Ingestion Job
-
-O `ingestion_job.py` é responsável exclusivamente pela extração do MongoDB e pela disponibilização dos dados na Landing Zone.
-
-```
+```text
 MongoDB Atlas
-      │
-      ▼
-MongoReader
-      │
-      ├── Full / Incremental
-      ├── Watermark
-      ├── Batch
-      ├── Projection
-      └── Retry
-      │
-      ▼
-Landing Zone
-      │
-      └── JSON/JSONL
+  -> ingestion_job.py (projection, batch, watermark e retry)
+  -> Landing Zone (JSON Lines em Unity Catalog Volume)
+  -> bronze_job.py (Auto Loader, schema e checkpoint)
+  -> Delta Bronze (append-only e particionado por data)
+  -> silver_job.py (validação, deduplicação, hash e MERGE)
+  -> Delta Silver + quarentena + control_quality_log
 ```
 
-O job **não grava diretamente na Bronze**.
+| Componente | Responsabilidade |
+|---|---|
+| `notebooks/ingestion_job.py` | Extrair do MongoDB e gravar JSONL na Landing |
+| `notebooks/bronze_job.py` | Ingerir arquivos com Auto Loader e adicionar metadados técnicos |
+| `notebooks/silver_job.py` | Validar, deduplicar, normalizar e materializar a Silver |
+| `config/collections.json` | Definir coleções, modo, watermark, destino e projection |
+| `config/pipeline_config.yaml` | Centralizar catálogo, schemas, volumes e parâmetros técnicos |
 
-----------
+## Coleções
 
-## 2.2. Bronze Job
+| Coleção | Modo | Watermark | Projection |
+|---|---|---|---|
+| `users` | full | — | exclui `password` |
+| `theaters` | full | — | — |
+| `sessions` | full | — | exclui `jwt` |
+| `embedded_movies` | full | — | exclui `plot_embedding` |
+| `movies` | incremental | `lastupdated` | exclui `fullplot` |
+| `comments` | incremental | `date` | — |
 
-O `bronze_job.py` é responsável exclusivamente por consumir os arquivos disponibilizados na Landing Zone.
+## Técnicas adotadas
 
-Para coleções full (dimensões pequenas: users, theaters, sessions, embedded_movies), a Bronze é tratada como snapshot completo por execução via overwrite — cada execução substitui o snapshot anterior, mantendo fidelidade total à origem no momento da leitura.
+### 1. Leitura em lotes
 
-Para coleções incrementais (movies, comments), a Bronze é estritamente append-only via MERGE ... WHEN NOT MATCHED THEN INSERT, nunca reescrevendo histórico.
+O cursor do PyMongo usa `batch_size`. Os documentos são consumidos progressivamente e agrupados em arquivos JSONL de até `BATCH_SIZE`, limitando memória e reduzindo a criação de *small files*.
 
+A leitura não é particionada por faixas de `_id`: as coleções são processadas sequencialmente, escolha adequada ao volume do Mflix e aos limites da Free Edition.
+
+### 2. Projection na origem
+
+A configuração `projecao` é enviada ao `find` do MongoDB. Campos desnecessários ou sensíveis são descartados antes da transferência, reduzindo rede, memória, serialização e armazenamento.
+
+### 3. Paralelismo e particionamento
+
+Uma coleção é extraída por vez, evitando excesso de conexões simultâneas. Na Bronze, os dados são particionados por `_ingestion_date`, atributo de baixa cardinalidade. Checkpoints separados por coleção impedem o reprocessamento de arquivos já confirmados.
+
+### 4. Connection pooling
+
+Cada coleção cria um `MongoClient`, reutilizado pelo cursor, lotes e retries daquela coleção. O pool interno do PyMongo permanece ativo durante esse ciclo e o cliente é fechado em `finally`.
+
+O código ainda não compartilha um único cliente entre coleções nem configura `maxPoolSize`; essas são otimizações futuras.
+
+## Confiabilidade e qualidade
+
+### Incremental e retry
+
+`movies` e `comments` usam watermark persistida em `control_watermark`. O controle só avança após a gravação dos arquivos. Falhas transitórias são repetidas até `max_retries`, com backoff `2 ** tentativa`.
+
+### Tratamento de schema drift
+
+A Bronze combina schema explícito por coleção com `schema_evolution_mode: rescue`. Campos fora do contrato são preservados em `_rescued_data`. Na Silver, esses registros vão para quarentena com motivo `RESCUED_DATA`.
+
+`schemaLocation` e `checkpointLocation` são isolados por coleção. As escritas Delta usam `mergeSchema`, e os `MERGE` da Silver usam `withSchemaEvolution()`.
+
+### Metadados e idempotência
+
+A Bronze acrescenta `_ingestion_id`, `_ingestion_timestamp`, `_source_path`, `_source_collection`, `_load_type`, `_ingestion_date` e `_source_id`.
+
+A Silver mantém a versão mais recente por `_source_id`, calcula `_record_hash` e executa `MERGE`. Registros sem chave, corrompidos ou com rescued data são gravados em `silver.quarantine_<coleção>`.
+
+### Reconciliação
+
+Cada coleção gera uma linha em `silver.control_quality_log` com:
+
+- `source_count`: registros lidos da Bronze;
+- `valid_count`: válidos após deduplicação;
+- `quarantine_count`: registros rejeitados;
+- `null_key_count` e `null_key_pct`;
+- `duplicate_key_count`: grupos de `_source_id` duplicados na Bronze válida;
+- duração, status e mensagem de erro.
+
+A Silver não recebe `_source_id` nulo; essas linhas são colocadas em quarentena.
+
+Os status registrados pelo controle de qualidade são:
+
+- `SUCCESS`: execução sem exceção e sem quarentena;
+- `PARTIAL`: percentual de chaves nulas acima do limiar ou qualquer registro em quarentena;
+- `FAILED`: exceção durante o processamento.
+
+O controle atual não mede `destination_count`, divergência origem × destino, contagem por lote nem reconciliação acumulada. A duplicidade é calculada sobre toda a Bronze válida, não apenas sobre o lote atual.
+
+## Decisões de confiabilidade
+
+- **Carga full e incremental:** o modo é parametrizado por coleção.
+- **Watermark:** cargas incrementais consultam registros posteriores ao último ponto confirmado.
+- **Retry com backoff exponencial:** falhas transitórias são repetidas com espera crescente.
+- **Auto Loader:** descobre arquivos e mantém progresso por checkpoint.
+- **Schema explícito e rescued data:** dados inesperados são preservados em `_rescued_data`.
+- **Idempotência Silver:** `_source_id`, hash do registro e `MERGE` evitam duplicações.
+- **Quarentena:** registros inválidos são separados sem descarte silencioso.
+- **Observabilidade:** logs registram contagens, duração, watermark e status.
+
+## Configuração
+
+Parâmetros principais em `config/pipeline_config.yaml`:
+
+```yaml
+pipeline:
+  catalog: "meu_catalog"
+  landing_schema: "landing"
+  checkpoints_schema: "checkpoints"
+  schemas_schema: "schemas"
+  bronze_schema: "bronze"
+  silver_schema: "silver"
+  volume_name: "mflix"
+  batch_size: 5000
+  max_retries: 3
+  infer_column_types: true
+  schema_evolution_mode: "rescue"
+  available_now: true
 ```
-Landing Zone
-      │
-      ▼
-Databricks Auto Loader
-      │
-      ▼
-readStream
-      │
-      ├── Schema Inference
-      ├── schemaLocation
-      ├── Checkpoint
-      └── Schema Evolution
-      │
-      ▼
-Bronze Delta
-```
-## 2.3. Silver Job
-A preencher.
+A URI do MongoDB é obtida pelo secret scope `conn-db`, chave `cnn-mongodb-sampleflix`, e não fica no repositório.
 
-
-# 🗂️ Fonte de dados
-
-A fonte utilizada é o banco `sample_mflix` do MongoDB Atlas.
-
-
-----------
-
-# 📁 Estrutura do projeto
-
+## Estrutura
 
 ```text
 .
-├── README.md              
-│
+├── README.md
+├── CONTRIBUICOES.md
 ├── config/
-│   ├── pipeline_config.yaml      
-│   └── collections.json          
-│
-├── jobs/
-│   ├── ingestion_job.py
-│   └── bronze_job.py
-│
-├── notebooks/
-│   └── (seus notebooks de desenvolvimento e evidências)
-│
+│   ├── collections.json
+│   └── pipeline_config.yaml
 ├── docs/
-│   ├── ARQUITETURA.md    
-│   └── evidencias/        
-│       ├── execucao_01_full_load.png
-│       ├── execucao_02_incremental_sem_novidades.png
-│       └── execucao_03_incremental_com_dados.png
-│
-└── CONTRIBUICOES.md     
-
+│   └── ARQUITETURA.md
+└── notebooks/
+    ├── ingestion_job.py
+    ├── bronze_job.py
+    └── silver_job.py
 ```
 
 
+## Ordem de execução
 
+1. Executar `ingestion_job.py` para extrair dados para a Landing Zone.
+2. Executar `bronze_job.py` para materializar as tabelas Bronze.
+3. Executar `silver_job.py` para validar e materializar as tabelas Silver.
 
+Os notebooks devem ser executados no Git Folder do projeto, usando compute Serverless e com acesso ao catálogo e aos volumes configurados.
