@@ -259,7 +259,7 @@ def get_ingestion_id(collection):
     fazia reconcile() atualizar 0 linhas e qtd_gravada_destino
     ficar sempre null.
 
-    Fallback:busca na própria control_ingestion_log
+    Fallback corrigido: busca na própria control_ingestion_log
     o ingestion_id mais recente desta coleção que ainda não foi
     reconciliado (qtd_gravada_destino IS NULL). Isso cobre o
     caso de execução manual/interativa.
