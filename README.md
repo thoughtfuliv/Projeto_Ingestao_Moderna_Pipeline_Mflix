@@ -1,4 +1,4 @@
-﻿# Projeto Ingestão Moderna — Pipeline Mflix
+# Projeto Ingestão Moderna — Pipeline Mflix
 
 Pipeline do MongoDB Atlas para Databricks, desenvolvido para a disciplina de Engenharia de Dados / Ingestão Moderna de Dados. As seis coleções do banco `sample_mflix` são processadas por componentes genéricos e parametrizados, com cargas `full` ou `incremental`.
 
@@ -11,7 +11,7 @@ MongoDB Atlas
   -> bronze_job.py (Auto Loader, schema e checkpoint)
   -> Delta Bronze (append-only e particionado por data)
   -> silver_job.py (validação, deduplicação, hash e MERGE)
-  -> Delta Silver + quarentena + control_quality_log
+  -> Delta Silver + control_quality_log
 ```
 
 | Componente | Responsabilidade |
@@ -63,7 +63,7 @@ O código ainda não compartilha um único cliente entre coleções nem configur
 
 ### Tratamento de schema drift
 
-A Bronze combina schema explícito por coleção com `schema_evolution_mode: rescue`. Campos fora do contrato são preservados em `_rescued_data`. Na Silver, esses registros vão para quarentena com motivo `RESCUED_DATA`.
+A Bronze combina schema explícito por coleção com `schema_evolution_mode: rescue`. Campos fora do contrato são preservados em `_rescued_data`. Na Silver, registros com dados resgatados são filtrados e não seguem para as tabelas de negócio.
 
 `schemaLocation` e `checkpointLocation` são isolados por coleção. As escritas Delta usam `mergeSchema`, e os `MERGE` da Silver usam `withSchemaEvolution()`.
 
@@ -71,7 +71,7 @@ A Bronze combina schema explícito por coleção com `schema_evolution_mode: res
 
 A Bronze acrescenta `_ingestion_id`, `_ingestion_timestamp`, `_source_path`, `_source_collection`, `_load_type`, `_ingestion_date` e `_source_id`.
 
-A Silver mantém a versão mais recente por `_source_id`, calcula `_record_hash` e executa `MERGE`. Registros sem chave, corrompidos ou com rescued data são gravados em `silver.quarantine_<coleção>`.
+A Silver mantém a versão mais recente por `_source_id`, calcula `_record_hash` e executa `MERGE`. Registros sem chave, corrompidos ou com rescued data são filtrados antes da materialização.
 
 ### Reconciliação
 
@@ -79,17 +79,16 @@ Cada coleção gera uma linha em `silver.control_quality_log` com:
 
 - `source_count`: registros lidos da Bronze;
 - `valid_count`: válidos após deduplicação;
-- `quarantine_count`: registros rejeitados;
 - `null_key_count` e `null_key_pct`;
 - `duplicate_key_count`: grupos de `_source_id` duplicados na Bronze válida;
 - duração, status e mensagem de erro.
 
-A Silver não recebe `_source_id` nulo; essas linhas são colocadas em quarentena.
+A Silver não recebe `_source_id` nulo; essas linhas são filtradas antes do processamento.
 
 Os status registrados pelo controle de qualidade são:
 
-- `SUCCESS`: execução sem exceção e sem quarentena;
-- `PARTIAL`: percentual de chaves nulas acima do limiar ou qualquer registro em quarentena;
+- `SUCCESS`: execução sem exceção e com percentual de chaves nulas dentro do limiar;
+- `PARTIAL`: percentual de chaves nulas acima do limiar configurado;
 - `FAILED`: exceção durante o processamento.
 
 O controle atual não mede `destination_count`, divergência origem × destino, contagem por lote nem reconciliação acumulada. A duplicidade é calculada sobre toda a Bronze válida, não apenas sobre o lote atual.
@@ -102,7 +101,7 @@ O controle atual não mede `destination_count`, divergência origem × destino, 
 - **Auto Loader:** descobre arquivos e mantém progresso por checkpoint.
 - **Schema explícito e rescued data:** dados inesperados são preservados em `_rescued_data`.
 - **Idempotência Silver:** `_source_id`, hash do registro e `MERGE` evitam duplicações.
-- **Quarentena:** registros inválidos são separados sem descarte silencioso.
+
 - **Observabilidade:** logs registram contagens, duração, watermark e status.
 
 ## Configuração
@@ -142,7 +141,6 @@ A URI do MongoDB é obtida pelo secret scope `conn-db`, chave `cnn-mongodb-sampl
     ├── bronze_job.py
     └── silver_job.py
 ```
-
 
 ## Ordem de execução
 

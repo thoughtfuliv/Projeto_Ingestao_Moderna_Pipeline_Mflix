@@ -5,8 +5,11 @@
 # ///
 """Materializa a camada Silver do Mflix a partir das tabelas Delta Bronze.
 
-O job valida e coloca registros invalidos em quarentena, padroniza tipos,
-remove duplicidades e usa MERGE para manter a carga idempotente.
+O job padroniza tipos, remove duplicidades e usa MERGE para manter a carga
+idempotente. Todos os registros da Bronze sao processados e mergeados na
+Silver, independentemente de _source_id nulo/vazio, _corrupt_record ou
+_rescued_data — nao ha mais classificacao de "quarentena": as metricas de
+chave nula/duplicada em control_quality_log sao apenas informativas.
 """
 
 import datetime
@@ -20,6 +23,7 @@ from delta.tables import DeltaTable
 from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
+    ArrayType,
     DoubleType,
     LongType,
     StringType,
@@ -55,7 +59,6 @@ CATALOG = PIPELINE["catalog"]
 BRONZE_SCHEMA = PIPELINE["bronze_schema"]
 SILVER_SCHEMA = PIPELINE["silver_schema"]
 QUALITY_TABLE = f"{CATALOG}.{SILVER_SCHEMA}.control_quality_log"
-NULL_KEY_THRESHOLD_PCT = float(PIPELINE.get("silver_null_key_threshold_pct", 0.0))
 
 
 def validate_identifier(value: str) -> str:
@@ -78,7 +81,6 @@ QUALITY_LOG_SCHEMA = StructType([
     StructField("target_table", StringType(), False),
     StructField("source_count", LongType(), False),
     StructField("valid_count", LongType(), False),
-    StructField("quarantine_count", LongType(), False),
     StructField("null_key_count", LongType(), False),
     StructField("duplicate_key_count", LongType(), False),
     StructField("null_key_pct", DoubleType(), False),
@@ -138,28 +140,6 @@ def flatten_json_fields(df: DataFrame) -> DataFrame:
     return df.select(*projections)
 
 
-def add_validation_columns(df: DataFrame) -> DataFrame:
-    """Classifica registros sem descarta-los silenciosamente."""
-    source_id = F.trim(column_or_null(df, "_source_id").cast("string"))
-    corrupt = column_or_null(df, "_corrupt_record").isNotNull()
-    rescued_value = column_or_null(df, "_rescued_data").cast("string")
-    rescued = (
-        rescued_value.isNotNull()
-        & (F.trim(rescued_value) != "")
-        & (F.trim(rescued_value) != "{}")
-    )
-    reason = (
-        F.when(source_id.isNull() | (source_id == ""), F.lit("NULL_SOURCE_ID"))
-        .when(corrupt, F.lit("CORRUPT_RECORD"))
-        .when(rescued, F.lit("RESCUED_DATA"))
-    )
-    return (
-        df.withColumn("_source_id", source_id)
-        .withColumn("_quarantine_reason", reason)
-        .withColumn("_is_valid", F.col("_quarantine_reason").isNull())
-    )
-
-
 def normalize_business_types(df: DataFrame, collection: str) -> DataFrame:
     """Aplica padronizacoes deterministicas adequadas a Silver."""
     timestamp_columns = {
@@ -175,9 +155,12 @@ def normalize_business_types(df: DataFrame, collection: str) -> DataFrame:
     if "email" in result.columns:
         result = result.withColumn("email", F.lower(F.trim(F.col("email"))))
 
+    # _corrupt_record e _rescued_data sao colunas tecnicas da Bronze (nao
+    # sao mais usadas para filtrar registros) — removidas aqui so por
+    # higiene de schema antes de escrever na Silver.
     technical_errors = [
         name
-        for name in ("_corrupt_record", "_rescued_data", "_is_valid", "_quarantine_reason")
+        for name in ("_corrupt_record", "_rescued_data")
         if name in result.columns
     ]
     return result.drop(*technical_errors).withColumn(
@@ -186,19 +169,36 @@ def normalize_business_types(df: DataFrame, collection: str) -> DataFrame:
 
 
 def latest_by_source_id(df: DataFrame) -> DataFrame:
-    """Seleciona a versao mais recente de cada documento MongoDB."""
+    """Seleciona a versao mais recente de cada documento MongoDB.
+
+    Criterio de "mais recente", em ordem de prioridade:
+    1. _ingestion_timestamp — quando a Bronze gravou o registro.
+    2. _ingestion_id — identifica a execucao de ingestao (mas e o MESMO
+       valor para todas as linhas de uma execucao, entao nao desempata
+       documentos diferentes ingeridos juntos).
+    3. hash deterministico do conteudo do registro — desempate estavel
+       quando os dois criterios acima empatam (ex.: dois documentos com o
+       mesmo _source_id chegando no mesmo microbatch/execucao). Sem isso o
+       Spark escolhe um vencedor arbitrario, que pode mudar entre
+       execucoes e quebrar a idempotencia da carga.
+    """
     ordering = []
     if "_ingestion_timestamp" in df.columns:
         ordering.append(F.col("_ingestion_timestamp").desc_nulls_last())
     if "_ingestion_id" in df.columns:
         ordering.append(F.col("_ingestion_id").desc_nulls_last())
-    if not ordering:
-        ordering.append(F.col("_source_id"))
+
+    tiebreak_columns = sorted(column for column in df.columns if column != "_source_id")
+    df = df.withColumn(
+        "_dedup_tiebreak", F.hash(*[F.col(column) for column in tiebreak_columns])
+    )
+    ordering.append(F.col("_dedup_tiebreak").desc())
+
     window = Window.partitionBy("_source_id").orderBy(*ordering)
     return (
         df.withColumn("_row_number", F.row_number().over(window))
         .filter(F.col("_row_number") == 1)
-        .drop("_row_number")
+        .drop("_row_number", "_dedup_tiebreak")
     )
 
 
@@ -209,7 +209,7 @@ def add_record_hash(df: DataFrame) -> DataFrame:
         for column in df.columns
         if not column.startswith("_ingestion")
         and column
-        not in {"_silver_timestamp", "_quarantine_timestamp", "_record_hash"}
+        not in {"_silver_timestamp", "_record_hash"}
     )
     payload = F.to_json(F.struct(*[F.col(name) for name in business_columns]))
     return df.withColumn("_record_hash", F.sha2(payload, 256))
@@ -254,36 +254,63 @@ def merge_silver(df: DataFrame, target_table: str) -> None:
     )
 
 
-def merge_quarantine(df: DataFrame, quarantine_table: str) -> None:
-    """Persiste invalidos uma unica vez por conteudo e motivo."""
-    if df.limit(1).count() == 0:
+# Campos array de alta dimensionalidade (vetores de embedding) que nao devem
+# ser explodidos: cada documento geraria milhares de linhas sem valor
+# analitico. Ajuste os nomes aqui se o campo do seu embedded_movies tiver
+# outro nome.
+EXCLUDED_ARRAY_COLUMNS = {"embedding", "plot_embedding"}
+
+
+def explode_array_columns(df: DataFrame) -> tuple[DataFrame, bool]:
+    """Explode toda coluna do tipo array do DataFrame, duplicando a linha
+    para cada item (explode_outer preserva o registro quando o array e
+    nulo/vazio, em vez de descarta-lo como explode faria). Quando ha mais
+    de uma coluna array, os explodes sao encadeados: a linha e duplicada
+    para cada combinacao dos itens.
+
+    Retorna (dataframe_resultante, houve_explode). Quando houve_explode e
+    True, _source_id deixa de ser unico por linha — quem grava a tabela
+    precisa usar overwrite completo, nao MERGE (ver write_silver).
+    """
+    result = df
+    exploded_any = False
+    for field in df.schema.fields:
+        if not isinstance(field.dataType, ArrayType):
+            continue
+        if field.name in EXCLUDED_ARRAY_COLUMNS:
+            continue
+        result = result.withColumn(field.name, F.explode_outer(F.col(field.name)))
+        exploded_any = True
+    return result, exploded_any
+
+
+def write_silver(df: DataFrame, target_table: str, allow_merge: bool) -> None:
+    """Grava a Silver.
+
+    Usa MERGE idempotente por _source_id quando possivel (allow_merge=True).
+    Quando a linha foi duplicada por explode de array, _source_id deixa de
+    ser chave unica por linha e o MERGE quebraria (source nao pode ter mais
+    de uma linha por chave) — nesses casos faz overwrite completo da tabela,
+    que continua idempotente (mesma entrada sempre gera a mesma saida), so
+    que recalculado do zero em vez de incremental.
+    """
+    if allow_merge:
+        merge_silver(df, target_table)
         return
-    quarantined = add_record_hash(
-        df.withColumn("_quarantine_timestamp", F.current_timestamp())
-    )
-    if not spark.catalog.tableExists(quarantine_table):
-        quarantined.write.format("delta").option("mergeSchema", "true").mode(
-            "overwrite"
-        ).saveAsTable(quarantine_table)
-        return
-    (
-        DeltaTable.forName(spark, quarantine_table)
-        .alias("target")
-        .merge(
-            quarantined.alias("source"),
-            "target._record_hash = source._record_hash "
-            "AND target._quarantine_reason = source._quarantine_reason",
-        )
-        .withSchemaEvolution()
-        .whenNotMatchedInsertAll()
-        .execute()
-    )
+
+    df.write.format("delta").option("mergeSchema", "true").mode(
+        "overwrite"
+    ).saveAsTable(target_table)
 
 
 def write_quality_log(values: dict) -> None:
-    spark.createDataFrame([values], QUALITY_LOG_SCHEMA).write.format("delta").mode(
-        "append"
-    ).saveAsTable(QUALITY_TABLE)
+    (
+        spark.createDataFrame([values], QUALITY_LOG_SCHEMA)
+        .write.format("delta")
+        .option("mergeSchema", "true")
+        .mode("append")
+        .saveAsTable(QUALITY_TABLE)
+    )
 
 
 # COMMAND ----------
@@ -292,13 +319,11 @@ def process_collection(collection_cfg: dict) -> None:
     collection = validate_identifier(collection_cfg["collection"])
     source_table = f"{CATALOG}.{BRONZE_SCHEMA}.{collection}"
     target_table = f"{CATALOG}.{SILVER_SCHEMA}.{collection}"
-    quarantine_table = f"{CATALOG}.{SILVER_SCHEMA}.quarantine_{collection}"
     execution_id = str(uuid.uuid4())
     start_time = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
     metrics = {
         "source_count": 0,
         "valid_count": 0,
-        "quarantine_count": 0,
         "null_key_count": 0,
         "duplicate_key_count": 0,
         "null_key_pct": 0.0,
@@ -311,35 +336,52 @@ def process_collection(collection_cfg: dict) -> None:
 
         # Databricks Serverless nao oferece suporte a CACHE/PERSIST TABLE.
         # Mantemos o DataFrame lazy para evitar uma operacao nao suportada.
-        validated = add_validation_columns(spark.table(source_table))
-        metrics["source_count"] = validated.count()
-        metrics["null_key_count"] = validated.filter(
-            F.col("_quarantine_reason") == "NULL_SOURCE_ID"
+        source = spark.table(source_table)
+
+        # BUGFIX: a Bronze nunca teve uma coluna "_source_id" — a chave do
+        # documento MongoDB chega como "_id" (nome original do JSON exportado
+        # pelo ingestion_job.py). Sem esse rename, column_or_null(df,
+        # "_source_id") sempre caia no else e retornava null para toda
+        # linha, fazendo o filtro de chave unica descartar tudo.
+        if "_source_id" not in source.columns and "_id" in source.columns:
+            source = source.withColumnRenamed("_id", "_source_id")
+
+        metrics["source_count"] = source.count()
+        source_id = F.trim(column_or_null(source, "_source_id").cast("string"))
+        metrics["null_key_count"] = source.filter(
+            source_id.isNull() | (source_id == "")
         ).count()
-        metrics["quarantine_count"] = validated.filter(~F.col("_is_valid")).count()
         metrics["null_key_pct"] = (
             metrics["null_key_count"] * 100.0 / metrics["source_count"]
             if metrics["source_count"]
             else 0.0
         )
-        valid = validated.filter(F.col("_is_valid"))
+
+        # Sem classificacao de quarentena para _corrupt_record ou
+        # _rescued_data: esses registros sobem normalmente. A unica
+        # excecao e o controle de chave: so sobe dado com _source_id
+        # unico. Registros com _source_id nulo/vazio nao tem como ser
+        # deduplicados de forma idempotente entre execucoes (o MERGE
+        # nunca compara NULL = NULL como igual, entao um registro sem
+        # chave seria inserido de novo a cada execucao) — por isso sao
+        # os unicos excluidos aqui. null_key_count/duplicate_key_count
+        # continuam registrados no control_quality_log.
+        all_records = source.withColumn("_source_id", source_id)
         metrics["duplicate_key_count"] = (
-            valid.groupBy("_source_id").count().filter(F.col("count") > 1).count()
+            all_records.groupBy("_source_id").count().filter(F.col("count") > 1).count()
         )
 
-        merge_quarantine(validated.filter(~F.col("_is_valid")), quarantine_table)
-        latest = latest_by_source_id(valid)
+        with_unique_key = all_records.filter(
+            source_id.isNotNull() & (source_id != "")
+        )
+
+        latest = latest_by_source_id(with_unique_key)
         silver = add_record_hash(
             normalize_business_types(flatten_json_fields(latest), collection)
         )
+        silver, exploded = explode_array_columns(silver)
         metrics["valid_count"] = silver.count()
-        merge_silver(silver, target_table)
-
-        if (
-            metrics["null_key_pct"] > NULL_KEY_THRESHOLD_PCT
-            or metrics["quarantine_count"] > 0
-        ):
-            status = "PARTIAL"
+        write_silver(silver, target_table, allow_merge=not exploded)
     except Exception as exc:
         status, error_message = "FAILED", str(exc)[:1000]
 
@@ -358,7 +400,7 @@ def process_collection(collection_cfg: dict) -> None:
     })
     print(
         f"SILVER {collection}: status={status}, origem={metrics['source_count']}, "
-        f"validos={metrics['valid_count']}, quarentena={metrics['quarantine_count']}, "
+        f"processados={metrics['valid_count']}, "
         f"chaves_duplicadas={metrics['duplicate_key_count']}"
     )
     if status == "FAILED":

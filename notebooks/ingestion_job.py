@@ -1,3 +1,11 @@
+# Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "5"
+# ///
+# MAGIC %pip install pymongo
+# MAGIC dbutils.library.restartPython()
+
 # ============================================================
 # INGESTION JOB — MongoDB Atlas -> Landing Zone
 # ============================================================

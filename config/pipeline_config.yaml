@@ -1,46 +1,22 @@
-# ============================================================
-# pipeline_config.yaml
-# Configuração de infraestrutura da pipeline (R1).
-# As coleções a processar ficam em collections.json, não aqui.
-# Nenhuma credencial fica aqui — segredos vêm do Databricks
-# Secret Scope "conn-db" (ver notebooks/create-secret.py).
-# ============================================================
-
 pipeline:
-  # ------------------------------------------------------------
-  # Unity Catalog — nomes lógicos. Catalog, schemas e volumes são
-  # criados automaticamente pelos notebooks (CREATE ... IF NOT
-  # EXISTS), então isso roda em qualquer workspace Databricks com
-  # Unity Catalog habilitado, sem setup manual prévio.
-  # ------------------------------------------------------------
-  catalog: "main"
+  catalog: "meu_catalog"
+  landing_schema: "landing"
+  checkpoints_schema: "checkpoints"
+  schemas_schema: "schemas"
+  bronze_schema: "bronze"
+  silver_schema: "silver"
 
-  landing_schema: "landing_mflix"
-  bronze_schema: "bronze_mflix"
-  checkpoints_schema: "checkpoints_mflix"
-  schemas_schema: "schemas_mflix"
+  volume_name: "mflix"
 
-  # Mesmo nome de volume dentro de cada schema (landing/checkpoints/schemas)
-  volume_name: "raw"
+  landing_base_path: "/Volumes/meu_catalog/landing/mflix"
+  checkpoint_base_path: "/Volumes/meu_catalog/checkpoints/mflix"
+  schema_base_path: "/Volumes/meu_catalog/schemas/mflix"
 
-  # ------------------------------------------------------------
-  # R2 — leitura paginada / lotes
-  # ------------------------------------------------------------
   batch_size: 5000
   max_retries: 3
 
-  # R2 — controle de paralelismo / anti small-files na escrita da Bronze
-  bronze_output_partitions: 4
-
-  # ------------------------------------------------------------
-  # Schema drift (R7)
-  # ------------------------------------------------------------
   infer_column_types: true
-  schema_evolution_mode: "rescue"   # campos novos vão para _rescued_data
-  available_now: true
 
-  # ------------------------------------------------------------
-  # R8 — limiar de divergência (origem x destino) para reconciliação.
-  # Acima disso, a execução é marcada como PARTIAL/FAILED em vez de SUCCESS.
-  # ------------------------------------------------------------
-  reconciliation_threshold_pct: 0.5
+  schema_evolution_mode: "rescue"
+
+  available_now: true

@@ -920,17 +920,7 @@ def reconcile(
 ):
 
     """
-    CORREÇÃO: o UPDATE anterior montava o timestamp via
-    f-string (TIMESTAMP('{end_time.isoformat()}')), o que
-    podia falhar no parse dependendo do runtime do Spark SQL
-    (formato com 'T' e microssegundos). Como era uma única
-    instrução UPDATE, qualquer falha de parse fazia a linha
-    inteira não ser atualizada — explicando por que
-    qtd_gravada_destino e duracao_seg ficavam sempre null,
-    mesmo com status = SUCCESS (que vem do ingestion_job, não
-    daqui).
-
-    Agora usamos a API do Delta (DeltaTable.update), passando
+    Usamos a API do Delta (DeltaTable.update), passando
     os valores Python diretamente via F.lit — sem string
     interpolada, sem parsing de SQL. Também adicionamos
     traceback completo no except, para que qualquer falha
